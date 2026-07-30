@@ -36,7 +36,7 @@ while True:
 
     cv2.imshow("YOLO Details", annotated_frame)
 
-    if cv2.waitKey(1) & 0xFF == ord('q'):
+    if cv2.waitKey(1) & 0xFF == ord('x'):
         break
 
 camera.release()

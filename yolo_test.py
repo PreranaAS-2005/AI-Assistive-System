@@ -22,8 +22,8 @@ while True:
     # Display the frame
     cv2.imshow("YOLO Object Detection", annotated_frame)
 
-    # Exit when 'q' is pressed
-    if cv2.waitKey(1) & 0xFF == ord('q'):
+    # Exit when 'x' is pressed
+    if cv2.waitKey(1) & 0xFF == ord('x'):
         break
 
 camera.release()
