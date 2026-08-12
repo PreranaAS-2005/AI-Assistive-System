@@ -37,7 +37,7 @@ announced_tracks = set()
 
 
 # Open webcam
-camera = cv2.VideoCapture(0)
+camera = cv2.VideoCapture(1, cv2.CAP_MSMF)
 
 
 while True:
