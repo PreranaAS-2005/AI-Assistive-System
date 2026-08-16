@@ -21,11 +21,13 @@ Do NOT modify Phase 1 files (yolo_voice_manager.py etc.) to add this logic.
 
 from ultralytics import YOLO
 import cv2
+import threading
 
 from voice.voice_manager import VoiceManager
 from navigation.spatial_analyzer import analyze_detection
 from navigation.obstacle_guidance import ObstacleGuidance
 from navigation.direction_assistant import DirectionAssistant
+from navigation.target_search import TargetSearch
 
 
 # ---------------------------------------------------------------------------
@@ -61,6 +63,60 @@ voice = VoiceManager()
 # Phase 3 navigation modules
 guidance  = ObstacleGuidance()    # decides when to announce
 assistant = DirectionAssistant()  # builds the spoken message
+target_search = TargetSearch()    # target object search
+pending_target_message = None       # deferred if obstacle guidance speaks first
+
+
+# ---------------------------------------------------------------------------
+# Background stdin thread for target search commands
+# ---------------------------------------------------------------------------
+
+def _input_listener() -> None:
+    """Read search commands from the terminal in a background thread."""
+    print("[INFO] Target search commands:  find <object>  |  clear  |  help")
+    while True:
+        try:
+            line = input().strip()
+        except EOFError:
+            break
+
+        if not line:
+            continue
+
+        cmd = line.lower()
+
+        if cmd in ("clear", "stop", "stop search"):
+            target_search.clear_target()
+            print("[SEARCH] Target search cleared.")
+
+        elif cmd == "help":
+            print("[SEARCH] Commands:")
+            print("         find <object>   e.g.  find bottle")
+            print("         find my <object> e.g.  find my phone")
+            print("         clear           stop searching")
+
+        elif cmd.startswith("find") or cmd.startswith("search") or cmd.startswith("locate") or cmd.startswith("where"):
+            name = target_search.set_target(line)
+            if name:
+                print(f"[SEARCH] Searching for: {name}")
+            else:
+                err = target_search.get_error_message()
+                if err:
+                    print(f"[SEARCH] {err}")
+
+        else:
+            # Treat bare object name as a search request
+            name = target_search.set_target(line)
+            if name:
+                print(f"[SEARCH] Searching for: {name}")
+            else:
+                err = target_search.get_error_message()
+                if err:
+                    print(f"[SEARCH] {err}")
+
+
+_input_thread = threading.Thread(target=_input_listener, daemon=True)
+_input_thread.start()
 
 
 # ---------------------------------------------------------------------------
@@ -108,8 +164,12 @@ try:
         # 4. Process detections
         # ------------------------------------------------------------------
 
-        # All valid DetectionResult objects for this frame
+        # All valid DetectionResult objects for this frame (obstacles only)
         detections: list = []
+
+        # All valid DetectionResult objects including IGNORE-priority
+        # objects - used by target search
+        all_detections: list = []
 
         # All track IDs visible in this frame (including non-obstacles)
         # Used by ObstacleGuidance to detect disappearances
@@ -169,6 +229,9 @@ try:
                 if result is None:
                     continue
 
+                # (i-b) Keep every valid detection for target search
+                all_detections.append(result)
+
                 # (j) Skip IGNORE-priority objects
                 #     Track ID is already in current_track_ids above,
                 #     so disappearance tracking still works for them.
@@ -189,7 +252,10 @@ try:
 
         # ------------------------------------------------------------------
         # 6. Speak the highest-priority guidance message (at most one)
+        #    Obstacle guidance takes priority over target search.
         # ------------------------------------------------------------------
+        obstacle_spoke = False
+
         if decisions:
 
             # decisions[0] is highest priority due to sort in process_frame
@@ -197,6 +263,27 @@ try:
 
             if message is not None:
                 voice.speak(message)
+                obstacle_spoke = True
+
+        # ------------------------------------------------------------------
+        # 6b. Target object search (lower priority than obstacle guidance)
+        # ------------------------------------------------------------------
+        if target_search.is_active:
+            search_result = target_search.process_frame(all_detections)
+
+            if search_result.message is not None:
+                if obstacle_spoke:
+                    # Preserve the one-shot result until it is safe to speak.
+                    pending_target_message = search_result.message
+                else:
+                    voice.speak(search_result.message)
+                    pending_target_message = None
+
+        # If a target result was deferred because of an obstacle warning,
+        # announce it once the obstacle guidance is quiet.
+        if pending_target_message is not None and not obstacle_spoke:
+            voice.speak(pending_target_message)
+            pending_target_message = None
 
         # ------------------------------------------------------------------
         # 7. Display the annotated frame for visual debugging
