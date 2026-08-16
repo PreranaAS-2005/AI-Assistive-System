@@ -1,22 +1,33 @@
 """
-navigation_main.py
+Phase 3 Navigation Main
 
-Phase 3 standalone entry point for the AI-Based Assistive Spatial Memory
-and Guidance System.
+AI-Based Assistive Spatial Memory and Guidance System
 
-This file connects the existing YOLO tracking pipeline with the three
-Phase 3 navigation modules and the existing VoiceManager.
+NORMAL MODE
+-----------
+Objects are detected silently unless they are a close/near
+safety obstacle.
 
-Data flow:
-  Camera
-    → YOLOv8 tracking  (ultralytics)
-    → spatial_analyzer  (zone, proximity, priority)
-    → obstacle_guidance (when to announce)
-    → direction_assistant (what to say)
-    → VoiceManager (speaks it aloud)
+TARGET MODE
+-----------
+User types:
 
-Run this file to start Phase 3 navigation.
-Do NOT modify Phase 1 files (yolo_voice_manager.py etc.) to add this logic.
+    find bottle
+    find chair
+    find laptop
+
+The system then:
+
+    1. Finds the requested object.
+    2. Determines LEFT / CENTER / RIGHT.
+    3. Estimates approximate distance.
+    4. Speaks one combined instruction.
+
+Example:
+
+    Your bottle is on your right, about 1.2 meters away.
+
+The system does NOT continuously announce unrelated objects.
 """
 
 from ultralytics import YOLO
@@ -24,284 +35,867 @@ import cv2
 import threading
 
 from voice.voice_manager import VoiceManager
-from navigation.spatial_analyzer import analyze_detection
+
+from navigation.spatial_analyzer import (
+    analyze_detection,
+    Priority,
+    Zone,
+)
+
 from navigation.obstacle_guidance import ObstacleGuidance
 from navigation.direction_assistant import DirectionAssistant
 from navigation.target_search import TargetSearch
+from navigation.target_guidance import TargetGuidance
+from navigation.detection_filter import DetectionFilter
+from navigation.distance_estimator import DistanceEstimator
+from navigation.distance_smoother import DistanceSmoother
+from navigation.guidance_selector import GuidanceSelector
 
 
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
+# ============================================================
+# CONFIGURATION
+# ============================================================
 
-# Confidence threshold — consistent with yolo_voice_manager.py
 CONFIDENCE_THRESHOLD = 0.60
 
+CAMERA_INDEX = 2
 
-# ---------------------------------------------------------------------------
-# Initialization
-# ---------------------------------------------------------------------------
+IMAGE_SIZE = 320
 
-# Load YOLOv8 nano model (same model used by Phase 1)
+
+# ============================================================
+# LOAD YOLO
+# ============================================================
+
+print("[INFO] Loading YOLO model...")
+
 model = YOLO("yolov8n.pt")
 
-# Camera configuration
-# DroidCam Video is DirectShow index 0 on this machine.
-# Integrated Webcam is DirectShow index 1.
-# If DroidCam is not installed, use: cv2.VideoCapture(0, cv2.CAP_MSMF)
-camera = cv2.VideoCapture(2, cv2.CAP_DSHOW)
+print("[INFO] YOLO model loaded.")
 
-# Check that the camera opened successfully before entering the loop
+
+# ============================================================
+# CAMERA
+# ============================================================
+
+camera = cv2.VideoCapture(
+    CAMERA_INDEX,
+    cv2.CAP_DSHOW,
+)
+
 if not camera.isOpened():
-    print("[ERROR] Could not open OBS Virtual Camera (index 2, CAP_DSHOW).")
-    print("        Ensure DroidCam desktop client is running and the phone is connected.")
-    exit(1)
 
-# Initialize voice output (non-blocking, background thread)
+    print(
+        f"[ERROR] Could not open camera "
+        f"(index {CAMERA_INDEX})."
+    )
+
+    raise SystemExit(1)
+
+print("[INFO] Camera connected.")
+
+
+# ============================================================
+# MODULES
+# ============================================================
+
 voice = VoiceManager()
 
-# Phase 3 navigation modules
-guidance  = ObstacleGuidance()    # decides when to announce
-assistant = DirectionAssistant()  # builds the spoken message
-target_search = TargetSearch()    # target object search
-pending_target_message = None       # deferred if obstacle guidance speaks first
+obstacle_guidance = ObstacleGuidance()
+
+direction_assistant = DirectionAssistant()
+
+target_search = TargetSearch()
+
+target_guidance = TargetGuidance()
+
+detection_filter = DetectionFilter(
+    min_confidence=CONFIDENCE_THRESHOLD,
+    stability_frames=3,
+    history_size=5,
+)
+
+distance_estimator = DistanceEstimator(
+    focal_length_px=700.0,
+)
+
+# Larger threshold prevents tiny distance changes from
+# generating repeated voice messages.
+distance_smoother = DistanceSmoother(
+    window_size=5,
+    change_threshold_m=0.60,
+)
+
+guidance_selector = GuidanceSelector(
+    switch_distance_margin_m=0.75,
+)
 
 
-# ---------------------------------------------------------------------------
-# Background stdin thread for target search commands
-# ---------------------------------------------------------------------------
+# ============================================================
+# GLOBAL STATE
+# ============================================================
 
-def _input_listener() -> None:
-    """Read search commands from the terminal in a background thread."""
-    print("[INFO] Target search commands:  find <object>  |  clear  |  help")
+pending_target_message = None
+
+
+# ============================================================
+# TERMINAL INPUT
+# ============================================================
+
+def input_listener():
+    """
+    Terminal commands:
+
+        find bottle
+        find chair
+        find laptop
+
+        clear
+        help
+    """
+
+    print(
+        "[INFO] Target search commands: "
+        "find <object> | clear | help"
+    )
+
     while True:
+
         try:
-            line = input().strip()
+            command = input().strip()
+
         except EOFError:
             break
 
-        if not line:
+        if not command:
             continue
 
-        cmd = line.lower()
+        command_lower = command.lower()
 
-        if cmd in ("clear", "stop", "stop search"):
+
+        # ====================================================
+        # CLEAR
+        # ====================================================
+
+        if command_lower in (
+            "clear",
+            "stop",
+            "stop search",
+        ):
+
             target_search.clear_target()
-            print("[SEARCH] Target search cleared.")
 
-        elif cmd == "help":
+            target_guidance.stop()
+
+            distance_smoother.reset()
+
+            print(
+                "[SEARCH] Target search/guidance cleared."
+            )
+
+            continue
+
+
+        # ====================================================
+        # HELP
+        # ====================================================
+
+        if command_lower == "help":
+
+            print()
             print("[SEARCH] Commands:")
-            print("         find <object>   e.g.  find bottle")
-            print("         find my <object> e.g.  find my phone")
-            print("         clear           stop searching")
+            print("         find <object>")
+            print("         find my <object>")
+            print("         clear")
+            print()
 
-        elif cmd.startswith("find") or cmd.startswith("search") or cmd.startswith("locate") or cmd.startswith("where"):
-            name = target_search.set_target(line)
-            if name:
-                print(f"[SEARCH] Searching for: {name}")
+            continue
+
+
+        # ====================================================
+        # FIND
+        # ====================================================
+
+        if (
+            command_lower.startswith("find")
+            or command_lower.startswith("search")
+            or command_lower.startswith("locate")
+            or command_lower.startswith("where")
+        ):
+
+            # Stop previous target.
+            target_guidance.stop()
+
+            # Reset previous distance state.
+            distance_smoother.reset()
+
+            target_name = target_search.set_target(
+                command
+            )
+
+            if target_name:
+
+                print(
+                    f"[SEARCH] Searching for: "
+                    f"{target_name}"
+                )
+
+                voice.speak(
+                    f"Searching for {target_name}."
+                )
+
             else:
-                err = target_search.get_error_message()
-                if err:
-                    print(f"[SEARCH] {err}")
 
-        else:
-            # Treat bare object name as a search request
-            name = target_search.set_target(line)
-            if name:
-                print(f"[SEARCH] Searching for: {name}")
-            else:
-                err = target_search.get_error_message()
-                if err:
-                    print(f"[SEARCH] {err}")
+                error_message = (
+                    target_search.get_error_message()
+                )
 
+                if error_message:
 
-_input_thread = threading.Thread(target=_input_listener, daemon=True)
-_input_thread.start()
+                    print(
+                        f"[SEARCH] {error_message}"
+                    )
+
+            continue
 
 
-# ---------------------------------------------------------------------------
-# Main loop
-# ---------------------------------------------------------------------------
+        # ====================================================
+        # UNKNOWN COMMAND
+        # ====================================================
 
-print("[INFO] Phase 3 Navigation started. Press 'q' to quit.")
+        print(
+            "[INFO] Unknown command. "
+            "Type 'help' for commands."
+        )
+
+
+# ============================================================
+# START INPUT THREAD
+# ============================================================
+
+input_thread = threading.Thread(
+    target=input_listener,
+    daemon=True,
+)
+
+input_thread.start()
+
+
+# ============================================================
+# START
+# ============================================================
+
+print(
+    "[INFO] Phase 3 Navigation started. "
+    "Press 'q' to quit."
+)
+
+
+# ============================================================
+# MAIN LOOP
+# ============================================================
 
 try:
 
     while True:
 
-        # ------------------------------------------------------------------
-        # 1. Read one frame from the camera.
-        # ------------------------------------------------------------------
+        # ====================================================
+        # 1. READ CAMERA
+        # ====================================================
+
         success, frame = camera.read()
 
         if not success:
-            print("[ERROR] Failed to read frame from camera. Stopping.")
+
+            print(
+                "[ERROR] Failed to read camera frame."
+            )
+
             break
 
-        # ------------------------------------------------------------------
-        # 2. Get frame dimensions
-        #    frame.shape = (height, width, channels)
-        #    Always use shape[0] for height and shape[1] for width.
-        # ------------------------------------------------------------------
-        frame_height = float(frame.shape[0])
-        frame_width  = float(frame.shape[1])
 
-        # ------------------------------------------------------------------
-        # 3. Run YOLO tracking
-        #    persist=True keeps track IDs stable across frames.
-        #    verbose=False suppresses YOLO's per-frame console output.
-        # ------------------------------------------------------------------
+        frame_height = float(
+            frame.shape[0]
+        )
+
+        frame_width = float(
+            frame.shape[1]
+        )
+
+
+        # ====================================================
+        # 2. YOLO
+        # ====================================================
+
         results = model.track(
             frame,
             persist=True,
             verbose=False,
-            imgsz=320,
+            imgsz=IMAGE_SIZE,
+            conf=CONFIDENCE_THRESHOLD,
         )
 
         boxes = results[0].boxes
 
-        # ------------------------------------------------------------------
-        # 4. Process detections
-        # ------------------------------------------------------------------
 
-        # All valid DetectionResult objects for this frame (obstacles only)
-        detections: list = []
+        # ====================================================
+        # 3. DETECTION LISTS
+        # ====================================================
 
-        # All valid DetectionResult objects including IGNORE-priority
-        # objects - used by target search
-        all_detections: list = []
+        all_detections = []
 
-        # All track IDs visible in this frame (including non-obstacles)
-        # Used by ObstacleGuidance to detect disappearances
-        current_track_ids: set = set()
+        obstacle_detections = []
+
+        current_track_ids = set()
+
+
+        # ====================================================
+        # 4. PROCESS DETECTIONS
+        # ====================================================
 
         if boxes is not None:
 
             for box in boxes:
 
-                # (a) Get confidence score
-                confidence = float(box.conf[0])
+                # ------------------------------------------------
+                # Confidence
+                # ------------------------------------------------
 
-                # (b) Skip low-confidence detections
+                confidence = float(
+                    box.conf[0]
+                )
+
                 if confidence < CONFIDENCE_THRESHOLD:
                     continue
 
-                # (c) Get object class and name
-                class_id    = int(box.cls[0])
-                object_name = model.names[class_id]
 
-                # (d) Skip if the tracker has not assigned an ID yet
-                if box.id is None:
-                    continue
+                # ------------------------------------------------
+                # Class
+                # ------------------------------------------------
 
-                # (e) Get the persistent tracking ID
-                track_id = int(box.id[0])
+                class_id = int(
+                    box.cls[0]
+                )
 
-                # (f) Record this ID as visible this frame
-                #     Done before any obstacle filtering so disappearance
-                #     detection works correctly for all tracked objects
-                current_track_ids.add(track_id)
+                object_name = model.names[
+                    class_id
+                ]
 
-                # (g) Get bounding-box coordinates from the tensor
-                #     box.xyxy[0] = [x1, y1, x2, y2] as a PyTorch tensor
-                #     Cast each value to float for spatial_analyzer
+
+                # ------------------------------------------------
+                # Bounding box
+                # ------------------------------------------------
+
                 coords = box.xyxy[0]
+
                 x1 = float(coords[0])
                 y1 = float(coords[1])
                 x2 = float(coords[2])
                 y2 = float(coords[3])
 
-                # (h) Run spatial analysis
-                #     Returns None for invalid/zero-size boxes
-                result = analyze_detection(
-                    track_id     = track_id,
-                    object_name  = object_name,
-                    confidence   = confidence,
-                    x1           = x1,
-                    y1           = y1,
-                    x2           = x2,
-                    y2           = y2,
-                    frame_width  = frame_width,
-                    frame_height = frame_height,
+
+                # ------------------------------------------------
+                # Track ID
+                # ------------------------------------------------
+
+                if box.id is not None:
+
+                    track_id = int(
+                        box.id[0]
+                    )
+
+                    current_track_ids.add(
+                        track_id
+                    )
+
+                else:
+
+                    # Temporary ID.
+                    #
+                    # Do not discard the detection just because
+                    # YOLO did not provide a persistent track ID.
+
+                    track_id = -(
+                        100000
+                        + class_id
+                        + int(x1)
+                        + int(y1)
+                    )
+
+
+                # ------------------------------------------------
+                # Spatial analysis
+                # ------------------------------------------------
+
+                detection = analyze_detection(
+                    track_id=track_id,
+                    object_name=object_name,
+                    confidence=confidence,
+                    x1=x1,
+                    y1=y1,
+                    x2=x2,
+                    y2=y2,
+                    frame_width=frame_width,
+                    frame_height=frame_height,
                 )
 
-                # (i) Skip invalid boxes
-                if result is None:
+
+                if detection is None:
                     continue
 
-                # (i-b) Keep every valid detection for target search
-                all_detections.append(result)
 
-                # (j) Skip IGNORE-priority objects
-                #     Track ID is already in current_track_ids above,
-                #     so disappearance tracking still works for them.
-                if not result.is_obstacle:
-                    continue
+                # ------------------------------------------------
+                # Keep ALL detections.
+                #
+                # This is important because target search needs
+                # to find far objects too.
+                # ------------------------------------------------
 
-                # (k) Add valid obstacle to this frame's detection list
-                detections.append(result)
+                all_detections.append(
+                    detection
+                )
 
-        # ------------------------------------------------------------------
-        # 5. Get guidance decisions
-        #    Decisions are returned sorted HIGH priority first.
-        # ------------------------------------------------------------------
-        decisions = guidance.process_frame(
-            detections,
-            current_track_ids,
+
+                # =================================================
+                # SAFETY FILTER
+                # =================================================
+                #
+                # Normal objects remain silent.
+                #
+                # Only close/near HIGH or MEDIUM priority
+                # objects directly in the center are safety
+                # obstacles.
+                # =================================================
+
+                if (
+                    detection.is_obstacle
+                    and detection.priority in (
+                        Priority.HIGH,
+                        Priority.MEDIUM,
+                    )
+                    and detection.zone == Zone.CENTER
+                    and detection.proximity in (
+                        "NEAR",
+                        "CLOSE",
+                    )
+                ):
+
+                    obstacle_detections.append(
+                        detection
+                    )
+
+
+        # ====================================================
+        # 5. SAFETY GUIDANCE
+        # ====================================================
+
+        obstacle_decisions = (
+            obstacle_guidance.process_frame(
+                obstacle_detections,
+                current_track_ids,
+            )
         )
 
-        # ------------------------------------------------------------------
-        # 6. Speak the highest-priority guidance message (at most one)
-        #    Obstacle guidance takes priority over target search.
-        # ------------------------------------------------------------------
+
+        selected_obstacle = (
+            guidance_selector.select(
+                obstacle_decisions
+            )
+        )
+
+
         obstacle_spoke = False
 
-        if decisions:
 
-            # decisions[0] is highest priority due to sort in process_frame
-            message = assistant.build_message(decisions[0])
+        # ----------------------------------------------------
+        # If user is searching for an object, that requested
+        # object gets target priority.
+        #
+        # Example:
+        #
+        # find chair
+        #
+        # Do NOT say:
+        #
+        # chair ahead
+        #
+        # Target guidance will handle the chair.
+        # ----------------------------------------------------
 
-            if message is not None:
-                voice.speak(message)
-                obstacle_spoke = True
+        active_target_name = (
+            target_guidance.target_name
+            if target_guidance.is_active
+            else None
+        )
 
-        # ------------------------------------------------------------------
-        # 6b. Target object search (lower priority than obstacle guidance)
-        # ------------------------------------------------------------------
+
+        if selected_obstacle is not None:
+
+            obstacle_detection = (
+                selected_obstacle.detection
+            )
+
+            obstacle_name = (
+                obstacle_detection.object_name
+                .lower()
+                .strip()
+            )
+
+
+            same_as_target = (
+                active_target_name is not None
+                and obstacle_name
+                == active_target_name.lower().strip()
+            )
+
+
+            if not same_as_target:
+
+                message = (
+                    direction_assistant.build_message(
+                        selected_obstacle
+                    )
+                )
+
+
+                if message is not None:
+
+                    voice.speak(
+                        message
+                    )
+
+                    obstacle_spoke = True
+
+
+        # ====================================================
+        # 6. TARGET SEARCH
+        # ====================================================
+
         if target_search.is_active:
-            search_result = target_search.process_frame(all_detections)
+
+            search_result = (
+                target_search.process_frame(
+                    all_detections
+                )
+            )
+
 
             if search_result.message is not None:
-                if obstacle_spoke:
-                    # Preserve the one-shot result until it is safe to speak.
-                    pending_target_message = search_result.message
-                else:
-                    voice.speak(search_result.message)
+
+                # ------------------------------------------------
+                # IMPORTANT:
+                #
+                # TargetSearch should NOT announce the target
+                # direction when it finds the target.
+                #
+                # TargetGuidance handles direction.
+                # ------------------------------------------------
+
+                if search_result.found:
+
                     pending_target_message = None
 
-        # If a target result was deferred because of an obstacle warning,
-        # announce it once the obstacle guidance is quiet.
-        if pending_target_message is not None and not obstacle_spoke:
-            voice.speak(pending_target_message)
+                else:
+
+                    if obstacle_spoke:
+
+                        pending_target_message = (
+                            search_result.message
+                        )
+
+                    else:
+
+                        voice.speak(
+                            search_result.message
+                        )
+
+                        pending_target_message = None
+
+
+                # ------------------------------------------------
+                # Target found
+                # ------------------------------------------------
+
+                if (
+                    search_result.found
+                    and search_result.object_name
+                ):
+
+                    target_guidance.start(
+                        search_result.object_name,
+                        "",
+                    )
+
+                    distance_smoother.reset()
+
+
+        # ====================================================
+        # 7. TARGET DIRECTION + DISTANCE
+        # ====================================================
+
+        target_guidance_spoke = False
+
+
+        if (
+            target_guidance.is_active
+            and not obstacle_spoke
+        ):
+
+            target_name = (
+                target_guidance.target_name
+            )
+
+
+            if target_name:
+
+                # ------------------------------------------------
+                # Find requested object
+                # ------------------------------------------------
+
+                target_candidates = [
+                    detection
+                    for detection in all_detections
+                    if (
+                        detection.object_name
+                        .lower()
+                        == target_name.lower()
+                    )
+                ]
+
+
+                if target_candidates:
+
+                    # ------------------------------------------------
+                    # Strongest matching detection
+                    # ------------------------------------------------
+
+                    target_detection = max(
+                        target_candidates,
+                        key=lambda detection: (
+                            detection.confidence,
+                            detection.box_area,
+                        ),
+                    )
+
+
+                    # ------------------------------------------------
+                    # Distance
+                    # ------------------------------------------------
+
+                    distance_estimate = (
+                        distance_estimator.estimate(
+                            target_detection
+                        )
+                    )
+
+
+                    if distance_estimate is not None:
+
+                        (
+                            distance_state,
+                            distance_changed,
+                        ) = (
+                            distance_smoother.update(
+                                distance_estimate
+                            )
+                        )
+
+                    else:
+
+                        distance_state = None
+
+                        distance_changed = False
+
+
+                    # ------------------------------------------------
+                    # Direction state
+                    # ------------------------------------------------
+
+                    guidance_result = (
+                        target_guidance.process_frame(
+                            all_detections
+                        )
+                    )
+
+
+                    # ------------------------------------------------
+                    # Target still found
+                    # ------------------------------------------------
+
+                    if guidance_result.found:
+
+                        stable_zone = (
+                            guidance_result.zone
+                        )
+
+
+                        # =================================================
+                        # DIRECTION TEXT
+                        # =================================================
+
+                        if stable_zone == Zone.LEFT:
+
+                            direction_text = (
+                                "on your left"
+                            )
+
+                        elif stable_zone == Zone.RIGHT:
+
+                            direction_text = (
+                                "on your right"
+                            )
+
+                        else:
+
+                            direction_text = (
+                                "ahead"
+                            )
+
+
+                        # =================================================
+                        # DISTANCE TEXT
+                        # =================================================
+
+                        distance_text = ""
+
+
+                        if distance_state is not None:
+
+                            distance_text = (
+                                f", about "
+                                f"{distance_state.distance_m:.1f} "
+                                f"meters away"
+                            )
+
+
+                        # =================================================
+                        # SPEAK WHEN:
+                        #
+                        # 1. Direction changed/stabilized
+                        #
+                        # OR
+                        #
+                        # 2. Meaningful distance change happened.
+                        # =================================================
+
+                        should_speak = False
+
+
+                        if (
+                            guidance_result.message
+                            is not None
+                        ):
+
+                            should_speak = True
+
+
+                        elif distance_changed:
+
+                            should_speak = True
+
+
+                        if should_speak:
+
+                            if distance_text:
+
+                                message = (
+                                    f"Your {target_name} "
+                                    f"is {direction_text}"
+                                    f"{distance_text}."
+                                )
+
+                            else:
+
+                                message = (
+                                    f"Your {target_name} "
+                                    f"is {direction_text}."
+                                )
+
+
+                            voice.speak(
+                                message
+                            )
+
+                            target_guidance_spoke = True
+
+
+        # ====================================================
+        # 8. PENDING SEARCH MESSAGE
+        # ====================================================
+
+        if (
+            pending_target_message is not None
+            and not obstacle_spoke
+            and not target_guidance_spoke
+        ):
+
+            voice.speak(
+                pending_target_message
+            )
+
             pending_target_message = None
 
-        # ------------------------------------------------------------------
-        # 7. Display the annotated frame for visual debugging
-        # ------------------------------------------------------------------
-        annotated_frame = results[0].plot()
-        cv2.imshow("Phase 3 Navigation", annotated_frame)
 
-        # ------------------------------------------------------------------
-        # 8. Check for quit key
-        # ------------------------------------------------------------------
-        if cv2.waitKey(1) & 0xFF == ord("q"):
-            print("[INFO] Quit key pressed. Stopping.")
+        # ====================================================
+        # 9. DETECTION FILTER
+        # ====================================================
+
+        # Keep this running as part of the Phase 3 pipeline.
+        #
+        # Target guidance does not wait for this filter.
+
+        stable_detections = (
+            detection_filter.process_frame(
+                all_detections
+            )
+        )
+
+        _ = stable_detections
+
+
+        # ====================================================
+        # 10. DISPLAY
+        # ====================================================
+
+        annotated_frame = (
+            results[0].plot()
+        )
+
+
+        cv2.imshow(
+            "Phase 3 Navigation",
+            annotated_frame
+        )
+
+
+        # ====================================================
+        # 11. QUIT
+        # ====================================================
+
+        key = cv2.waitKey(1) & 0xFF
+
+
+        if key == ord("q"):
+
+            print(
+                "[INFO] Quit key pressed. "
+                "Stopping."
+            )
+
             break
 
+
+# ============================================================
+# CLEANUP
+# ============================================================
+
 finally:
-    # ------------------------------------------------------------------
-    # 9. Clean shutdown — always runs even if an error occurs
-    # ------------------------------------------------------------------
+
     camera.release()
+
     cv2.destroyAllWindows()
-    print("[INFO] Camera released. Phase 3 Navigation stopped.")
+
+    print(
+        "[INFO] Camera released. "
+        "Phase 3 Navigation stopped."
+    )
