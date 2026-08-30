@@ -720,9 +720,9 @@ frame_count = 0
 
 camera = cv2.VideoCapture(
 
-    0,
+    1,
 
-    cv2.CAP_DSHOW
+    cv2.CAP_MSMF
 
 )
 
@@ -818,9 +818,9 @@ while True:
 
         camera = cv2.VideoCapture(
 
-            0,
+            1,
 
-            cv2.CAP_DSHOW
+            cv2.CAP_MSMF
 
         )
 
