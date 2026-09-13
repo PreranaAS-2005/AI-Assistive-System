@@ -758,14 +758,20 @@ try:
 
                         distance_text = ""
 
-
                         if distance_state is not None:
+
+                            steps = max(1, round(distance_state.distance_m / 0.5))
 
                             distance_text = (
                                 f", about "
-                                f"{distance_state.distance_m:.1f} "
-                                f"meters away"
+                                f"{steps} "
+                                f"steps away"
                             )
+
+
+
+
+                        
 
 
                         # =================================================
@@ -803,14 +809,6 @@ try:
                                     f"is {direction_text}"
                                     f"{distance_text}."
                                 )
-
-                            else:
-
-                                message = (
-                                    f"Your {target_name} "
-                                    f"is {direction_text}."
-                                )
-
 
                             voice.speak(
                                 message
