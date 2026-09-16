@@ -1,38 +1,12 @@
 """
-Phase 3 Navigation Main
-
+Phase 3 Navigation Module
 AI-Based Assistive Spatial Memory and Guidance System
-
-NORMAL MODE
------------
-Objects are detected silently unless they are a close/near
-safety obstacle.
-
-TARGET MODE
------------
-User types:
-
-    find bottle
-    find chair
-    find laptop
-
-The system then:
-
-    1. Finds the requested object.
-    2. Determines LEFT / CENTER / RIGHT.
-    3. Estimates approximate distance.
-    4. Speaks one combined instruction.
-
-Example:
-
-    Your bottle is on your right, about 1.2 meters away.
-
-The system does NOT continuously announce unrelated objects.
 """
 
 from ultralytics import YOLO
 import cv2
 import threading
+import sys
 
 from voice.voice_manager import VoiceManager
 
@@ -56,15 +30,18 @@ from navigation.guidance_selector import GuidanceSelector
 # CONFIGURATION
 # ============================================================
 
-CONFIDENCE_THRESHOLD = 0.60
+CONFIDENCE_THRESHOLD = 0.30
+IMAGE_SIZE = 640
 
-CAMERA_INDEX = 2
+# Average human stride length
+AVERAGE_STEP_METERS = 0.70
 
-IMAGE_SIZE = 320
+# DroidCam / camera index
+CAMERA_INDEX = 1
 
 
 # ============================================================
-# LOAD YOLO
+# INITIALIZATION
 # ============================================================
 
 print("[INFO] Loading YOLO model...")
@@ -73,31 +50,6 @@ model = YOLO("yolov8n.pt")
 
 print("[INFO] YOLO model loaded.")
 
-
-# ============================================================
-# CAMERA
-# ============================================================
-
-camera = cv2.VideoCapture(
-    CAMERA_INDEX,
-    cv2.CAP_DSHOW,
-)
-
-if not camera.isOpened():
-
-    print(
-        f"[ERROR] Could not open camera "
-        f"(index {CAMERA_INDEX})."
-    )
-
-    raise SystemExit(1)
-
-print("[INFO] Camera connected.")
-
-
-# ============================================================
-# MODULES
-# ============================================================
 
 voice = VoiceManager()
 
@@ -109,169 +61,147 @@ target_search = TargetSearch()
 
 target_guidance = TargetGuidance()
 
+
 detection_filter = DetectionFilter(
     min_confidence=CONFIDENCE_THRESHOLD,
     stability_frames=3,
     history_size=5,
 )
 
+
 distance_estimator = DistanceEstimator(
     focal_length_px=700.0,
 )
 
-# Larger threshold prevents tiny distance changes from
-# generating repeated voice messages.
+
 distance_smoother = DistanceSmoother(
     window_size=5,
     change_threshold_m=0.60,
 )
+
 
 guidance_selector = GuidanceSelector(
     switch_distance_margin_m=0.75,
 )
 
 
-# ============================================================
-# GLOBAL STATE
-# ============================================================
-
 pending_target_message = None
 
 
 # ============================================================
-# TERMINAL INPUT
+# CAMERA SETUP
+# ============================================================
+
+print(
+    f"[INFO] Connecting to camera index {CAMERA_INDEX}..."
+)
+
+camera = cv2.VideoCapture(
+    CAMERA_INDEX,
+    cv2.CAP_MSMF
+)
+
+
+if not camera.isOpened():
+
+    print(
+        f"[ERROR] Could not open camera index "
+        f"{CAMERA_INDEX}."
+    )
+
+    print(
+        "[ERROR] Make sure DroidCam is running "
+        "and connected."
+    )
+
+    sys.exit(1)
+
+
+print(
+    f"[INFO] Camera index {CAMERA_INDEX} connected."
+)
+
+
+# ============================================================
+# KEYBOARD INPUT LISTENER
 # ============================================================
 
 def input_listener():
-    """
-    Terminal commands:
 
-        find bottle
-        find chair
-        find laptop
-
-        clear
-        help
-    """
-
-    print(
-        "[INFO] Target search commands: "
-        "find <object> | clear | help"
-    )
+    global pending_target_message
 
     while True:
 
         try:
-            command = input().strip()
 
-        except EOFError:
-            break
+            user_input = input().strip()
 
-        if not command:
-            continue
-
-        command_lower = command.lower()
+            if not user_input:
+                continue
 
 
-        # ====================================================
-        # CLEAR
-        # ====================================================
+            # ------------------------------------------------
+            # CANCEL TARGET
+            # ------------------------------------------------
 
-        if command_lower in (
-            "clear",
-            "stop",
-            "stop search",
-        ):
+            if user_input.lower() == "cancel":
 
-            target_search.clear_target()
+                target_search.cancel()
 
-            target_guidance.stop()
+                target_guidance.stop()
 
-            distance_smoother.reset()
+                distance_smoother.reset()
 
-            print(
-                "[SEARCH] Target search/guidance cleared."
-            )
-
-            continue
-
-
-        # ====================================================
-        # HELP
-        # ====================================================
-
-        if command_lower == "help":
-
-            print()
-            print("[SEARCH] Commands:")
-            print("         find <object>")
-            print("         find my <object>")
-            print("         clear")
-            print()
-
-            continue
-
-
-        # ====================================================
-        # FIND
-        # ====================================================
-
-        if (
-            command_lower.startswith("find")
-            or command_lower.startswith("search")
-            or command_lower.startswith("locate")
-            or command_lower.startswith("where")
-        ):
-
-            # Stop previous target.
-            target_guidance.stop()
-
-            # Reset previous distance state.
-            distance_smoother.reset()
-
-            target_name = target_search.set_target(
-                command
-            )
-
-            if target_name:
+                pending_target_message = None
 
                 print(
-                    f"[SEARCH] Searching for: "
-                    f"{target_name}"
+                    "[SEARCH] Target guidance cancelled."
                 )
 
                 voice.speak(
-                    f"Searching for {target_name}."
+                    "Target cancelled."
                 )
+
+
+            # ------------------------------------------------
+            # FIND TARGET
+            # ------------------------------------------------
 
             else:
 
-                error_message = (
-                    target_search.get_error_message()
+                target_guidance.stop()
+
+                distance_smoother.reset()
+
+                pending_target_message = None
+
+                clean_target = (
+                    user_input
+                    .lower()
+                    .strip()
                 )
 
-                if error_message:
+                set_name = target_search.set_target(
+                    f"find {clean_target}"
+                )
+
+
+                if set_name:
 
                     print(
-                        f"[SEARCH] {error_message}"
+                        f"[SEARCH] Searching for: "
+                        f"{set_name}"
                     )
 
-            continue
+                    voice.speak(
+                        f"Searching for {set_name}."
+                    )
 
 
-        # ====================================================
-        # UNKNOWN COMMAND
-        # ====================================================
+        except (EOFError, KeyboardInterrupt):
 
-        print(
-            "[INFO] Unknown command. "
-            "Type 'help' for commands."
-        )
+            break
 
-
-# ============================================================
-# START INPUT THREAD
-# ============================================================
 
 input_thread = threading.Thread(
     target=input_listener,
@@ -282,33 +212,59 @@ input_thread.start()
 
 
 # ============================================================
-# START
+# AUTO-APPLY SPOKEN TARGET
+# ============================================================
+
+if len(sys.argv) > 1:
+
+    target_arg = (
+        sys.argv[1]
+        .lower()
+        .strip()
+    )
+
+    target_search.set_target(
+        f"find {target_arg}"
+    )
+
+    voice.speak(
+        f"Searching for {target_arg}."
+    )
+
+
+# ============================================================
+# MAIN NAVIGATION LOOP
 # ============================================================
 
 print(
-    "[INFO] Phase 3 Navigation started. "
-    "Press 'q' to quit."
+    "[INFO] Navigation running on DroidCam."
 )
 
+print(
+    "[INFO] Type 'find <object>' in the terminal."
+)
 
-# ============================================================
-# MAIN LOOP
-# ============================================================
+print(
+    "[INFO] Press 'q' on the camera window to quit."
+)
+
 
 try:
 
     while True:
 
         # ====================================================
-        # 1. READ CAMERA
+        # READ CAMERA
         # ====================================================
 
         success, frame = camera.read()
 
-        if not success:
+
+        if not success or frame is None:
 
             print(
-                "[ERROR] Failed to read camera frame."
+                "[ERROR] Failed to read frame "
+                "from camera."
             )
 
             break
@@ -324,23 +280,26 @@ try:
 
 
         # ====================================================
-        # 2. YOLO
+        # YOLO TRACKING
         # ====================================================
 
         results = model.track(
+
             frame,
+
             persist=True,
+
             verbose=False,
+
             imgsz=IMAGE_SIZE,
+
             conf=CONFIDENCE_THRESHOLD,
+
         )
+
 
         boxes = results[0].boxes
 
-
-        # ====================================================
-        # 3. DETECTION LISTS
-        # ====================================================
 
         all_detections = []
 
@@ -350,52 +309,84 @@ try:
 
 
         # ====================================================
-        # 4. PROCESS DETECTIONS
+        # PROCESS DETECTIONS
         # ====================================================
 
         if boxes is not None:
 
             for box in boxes:
 
-                # ------------------------------------------------
-                # Confidence
-                # ------------------------------------------------
-
                 confidence = float(
                     box.conf[0]
                 )
 
-                if confidence < CONFIDENCE_THRESHOLD:
+
+                if (
+                    confidence
+                    < CONFIDENCE_THRESHOLD
+                ):
+
                     continue
 
-
-                # ------------------------------------------------
-                # Class
-                # ------------------------------------------------
 
                 class_id = int(
                     box.cls[0]
                 )
 
-                object_name = model.names[
-                    class_id
-                ]
+
+                object_name = (
+                    model.names[class_id]
+                )
 
 
                 # ------------------------------------------------
-                # Bounding box
+                # YOLO DIAGNOSTIC
+                # ------------------------------------------------
+
+                print(
+                    f"[YOLO] {object_name} | "
+                    f"confidence={confidence:.2f}"
+                )
+
+
+                if (
+                    object_name.lower().strip()
+                    == "bottle"
+                ):
+
+                    print(
+                        f"[BOTTLE YOLO] "
+                        f"Bottle detected by YOLO | "
+                        f"confidence={confidence:.2f}"
+                    )
+
+
+                # ------------------------------------------------
+                # BOUNDING BOX
                 # ------------------------------------------------
 
                 coords = box.xyxy[0]
 
-                x1 = float(coords[0])
-                y1 = float(coords[1])
-                x2 = float(coords[2])
-                y2 = float(coords[3])
+
+                x1 = float(
+                    coords[0]
+                )
+
+                y1 = float(
+                    coords[1]
+                )
+
+                x2 = float(
+                    coords[2]
+                )
+
+                y2 = float(
+                    coords[3]
+                )
 
 
                 # ------------------------------------------------
-                # Track ID
+                # TRACK ID
                 # ------------------------------------------------
 
                 if box.id is not None:
@@ -410,11 +401,6 @@ try:
 
                 else:
 
-                    # Temporary ID.
-                    #
-                    # Do not discard the detection just because
-                    # YOLO did not provide a persistent track ID.
-
                     track_id = -(
                         100000
                         + class_id
@@ -424,60 +410,100 @@ try:
 
 
                 # ------------------------------------------------
-                # Spatial analysis
+                # SPATIAL ANALYSIS
                 # ------------------------------------------------
 
                 detection = analyze_detection(
+
                     track_id=track_id,
+
                     object_name=object_name,
+
                     confidence=confidence,
+
                     x1=x1,
+
                     y1=y1,
+
                     x2=x2,
+
                     y2=y2,
+
                     frame_width=frame_width,
+
                     frame_height=frame_height,
+
                 )
 
 
                 if detection is None:
+
+                    print(
+                        f"[REJECTED] "
+                        f"{object_name} "
+                        f"was rejected by spatial analyzer."
+                    )
+
                     continue
 
 
                 # ------------------------------------------------
-                # Keep ALL detections.
-                #
-                # This is important because target search needs
-                # to find far objects too.
+                # ACCEPTED DETECTION DIAGNOSTIC
                 # ------------------------------------------------
+
+                print(
+                    f"[ACCEPTED] "
+                    f"{detection.object_name} | "
+                    f"confidence={detection.confidence:.2f} | "
+                    f"zone={detection.zone} | "
+                    f"proximity={detection.proximity}"
+                )
+
 
                 all_detections.append(
                     detection
                 )
 
 
-                # =================================================
-                # SAFETY FILTER
-                # =================================================
-                #
-                # Normal objects remain silent.
-                #
-                # Only close/near HIGH or MEDIUM priority
-                # objects directly in the center are safety
-                # obstacles.
-                # =================================================
+                if (
+                    detection.object_name
+                    .lower()
+                    .strip()
+                    == "bottle"
+                ):
+
+                    print(
+                        f"[BOTTLE ACCEPTED] "
+                        f"Bottle reached all_detections | "
+                        f"confidence="
+                        f"{detection.confidence:.2f} | "
+                        f"zone={detection.zone}"
+                    )
+
+
+                # ------------------------------------------------
+                # OBSTACLE FILTER
+                # ------------------------------------------------
 
                 if (
+
                     detection.is_obstacle
-                    and detection.priority in (
+
+                    and detection.priority
+                    in (
                         Priority.HIGH,
                         Priority.MEDIUM,
                     )
-                    and detection.zone == Zone.CENTER
-                    and detection.proximity in (
+
+                    and detection.zone
+                    == Zone.CENTER
+
+                    and detection.proximity
+                    in (
                         "NEAR",
                         "CLOSE",
                     )
+
                 ):
 
                     obstacle_detections.append(
@@ -486,7 +512,7 @@ try:
 
 
         # ====================================================
-        # 5. SAFETY GUIDANCE
+        # SAFETY & OBSTACLE HANDLING
         # ====================================================
 
         obstacle_decisions = (
@@ -507,58 +533,53 @@ try:
         obstacle_spoke = False
 
 
-        # ----------------------------------------------------
-        # If user is searching for an object, that requested
-        # object gets target priority.
-        #
-        # Example:
-        #
-        # find chair
-        #
-        # Do NOT say:
-        #
-        # chair ahead
-        #
-        # Target guidance will handle the chair.
-        # ----------------------------------------------------
-
         active_target_name = (
+
             target_guidance.target_name
+
             if target_guidance.is_active
+
             else None
+
         )
 
 
         if selected_obstacle is not None:
 
-            obstacle_detection = (
-                selected_obstacle.detection
-            )
-
-            obstacle_name = (
-                obstacle_detection.object_name
+            obs_name = (
+                selected_obstacle
+                .detection
+                .object_name
                 .lower()
                 .strip()
             )
 
 
             same_as_target = (
-                active_target_name is not None
-                and obstacle_name
-                == active_target_name.lower().strip()
+
+                active_target_name
+
+                and
+
+                obs_name
+                == active_target_name
+                .lower()
+                .strip()
+
             )
 
 
             if not same_as_target:
 
                 message = (
-                    direction_assistant.build_message(
+                    direction_assistant
+                    .build_message(
                         selected_obstacle
                     )
                 )
 
 
-                if message is not None:
+                if message:
 
                     voice.speak(
                         message
@@ -568,8 +589,11 @@ try:
 
 
         # ====================================================
-        # 6. TARGET SEARCH
+        # TARGET SEARCH
         # ====================================================
+
+        target_guidance_spoke = False
+
 
         if target_search.is_active:
 
@@ -580,16 +604,33 @@ try:
             )
 
 
-            if search_result.message is not None:
+            # ------------------------------------------------
+            # TARGET SEARCH DIAGNOSTIC
+            # ------------------------------------------------
 
-                # ------------------------------------------------
-                # IMPORTANT:
-                #
-                # TargetSearch should NOT announce the target
-                # direction when it finds the target.
-                #
-                # TargetGuidance handles direction.
-                # ------------------------------------------------
+            if target_search.target_name:
+
+                target_in_frame = any(
+
+                    d.object_name.lower().strip()
+                    ==
+                    target_search.target_name.lower().strip()
+
+                    for d in all_detections
+
+                )
+
+
+                print(
+                    f"[SEARCH CHECK] "
+                    f"target="
+                    f"{target_search.target_name} | "
+                    f"visible="
+                    f"{target_in_frame}"
+                )
+
+
+            if search_result.message is not None:
 
                 if search_result.found:
 
@@ -612,33 +653,43 @@ try:
                         pending_target_message = None
 
 
-                # ------------------------------------------------
-                # Target found
-                # ------------------------------------------------
+            # ------------------------------------------------
+            # TARGET FOUND
+            # ------------------------------------------------
 
-                if (
-                    search_result.found
-                    and search_result.object_name
-                ):
+            if (
 
-                    target_guidance.start(
-                        search_result.object_name,
-                        "",
-                    )
+                search_result.found
 
-                    distance_smoother.reset()
+                and
+
+                search_result.object_name
+
+            ):
+
+                target_guidance.start(
+
+                    search_result.object_name,
+
+                    "",
+
+                )
+
+                distance_smoother.reset()
 
 
         # ====================================================
-        # 7. TARGET DIRECTION + DISTANCE
+        # CONTINUOUS TARGET GUIDANCE
         # ====================================================
-
-        target_guidance_spoke = False
-
 
         if (
+
             target_guidance.is_active
-            and not obstacle_spoke
+
+            and
+
+            not obstacle_spoke
+
         ):
 
             target_name = (
@@ -648,185 +699,319 @@ try:
 
             if target_name:
 
-                # ------------------------------------------------
-                # Find requested object
-                # ------------------------------------------------
+                candidates = [
 
-                target_candidates = [
-                    detection
-                    for detection in all_detections
+                    d
+
+                    for d in all_detections
+
                     if (
-                        detection.object_name
-                        .lower()
+                        d.object_name.lower()
                         == target_name.lower()
                     )
+
                 ]
 
 
-                if target_candidates:
+                if candidates:
 
-                    # ------------------------------------------------
-                    # Strongest matching detection
-                    # ------------------------------------------------
+                    target_det = max(
 
-                    target_detection = max(
-                        target_candidates,
-                        key=lambda detection: (
-                            detection.confidence,
-                            detection.box_area,
+                        candidates,
+
+                        key=lambda d: (
+                            d.confidence,
+                            d.box_area,
                         ),
+
                     )
 
 
                     # ------------------------------------------------
-                    # Distance
+                    # DISTANCE
                     # ------------------------------------------------
 
-                    distance_estimate = (
-                        distance_estimator.estimate(
-                            target_detection
+                    dist_estimate = (
+                        distance_estimator
+                        .estimate(
+                            target_det
                         )
                     )
 
 
-                    if distance_estimate is not None:
+                    if dist_estimate:
 
                         (
-                            distance_state,
-                            distance_changed,
+                            dist_state,
+                            dist_changed,
                         ) = (
                             distance_smoother.update(
-                                distance_estimate
+                                dist_estimate
                             )
                         )
 
                     else:
 
-                        distance_state = None
+                        dist_state = None
 
-                        distance_changed = False
+                        dist_changed = False
 
 
                     # ------------------------------------------------
-                    # Direction state
+                    # TARGET GUIDANCE
                     # ------------------------------------------------
 
-                    guidance_result = (
-                        target_guidance.process_frame(
+                    guidance_res = (
+                        target_guidance
+                        .process_frame(
                             all_detections
                         )
                     )
 
 
-                    # ------------------------------------------------
-                    # Target still found
-                    # ------------------------------------------------
-
-                    if guidance_result.found:
-
-                        stable_zone = (
-                            guidance_result.zone
-                        )
-
-
-                        # =================================================
-                        # DIRECTION TEXT
-                        # =================================================
-
-                        if stable_zone == Zone.LEFT:
-
-                            direction_text = (
-                                "on your left"
-                            )
-
-                        elif stable_zone == Zone.RIGHT:
-
-                            direction_text = (
-                                "on your right"
-                            )
-
-                        else:
-
-                            direction_text = (
-                                "ahead"
-                            )
-
-
-                        # =================================================
-                        # DISTANCE TEXT
-                        # =================================================
-
-                        distance_text = ""
-
-
-                        if distance_state is not None:
-
-                            distance_text = (
-                                f", about "
-                                f"{distance_state.distance_m:.1f} "
-                                f"meters away"
-                            )
-
-
-                        # =================================================
-                        # SPEAK WHEN:
-                        #
-                        # 1. Direction changed/stabilized
-                        #
-                        # OR
-                        #
-                        # 2. Meaningful distance change happened.
-                        # =================================================
-
-                        should_speak = False
-
+                    if guidance_res.found:
 
                         if (
-                            guidance_result.message
+
+                            guidance_res.message
                             is not None
+
+                            or
+
+                            dist_changed
+
                         ):
 
-                            should_speak = True
+                            dist_m = (
+
+                                dist_state
+                                .distance_m
+
+                                if dist_state
+
+                                else None
+
+                            )
 
 
-                        elif distance_changed:
+                            # ------------------------------------------------
+                            # VERY CLOSE
+                            # ------------------------------------------------
 
-                            should_speak = True
+                            if (
 
+                                dist_m
 
-                        if should_speak:
+                                and
 
-                            if distance_text:
+                                dist_m < 0.6
+
+                            ):
 
                                 message = (
-                                    f"Your {target_name} "
-                                    f"is {direction_text}"
-                                    f"{distance_text}."
+
+                                    f"Your "
+                                    f"{target_name} "
+                                    f"is right in "
+                                    f"front of you. "
+                                    f"Reach out."
+
                                 )
+
 
                             else:
 
-                                message = (
-                                    f"Your {target_name} "
-                                    f"is {direction_text}."
-                                )
+                                # --------------------------------------------
+                                # HUMAN STEPS
+                                # --------------------------------------------
+
+                                if dist_m:
+
+                                    steps = max(
+
+                                        1,
+
+                                        round(
+                                            dist_m
+                                            / AVERAGE_STEP_METERS
+                                        ),
+
+                                    )
+
+                                else:
+
+                                    steps = None
+
+
+                                if steps:
+
+                                    step_str = (
+
+                                        f"{steps} "
+
+                                        f"{'step' if steps == 1 else 'steps'}"
+
+                                    )
+
+                                else:
+
+                                    step_str = ""
+
+
+                                if dist_m:
+
+                                    dist_str = (
+
+                                        f", about "
+                                        f"{dist_m:.1f} "
+                                        f"meters away"
+
+                                    )
+
+                                else:
+
+                                    dist_str = ""
+
+
+                                # ------------------------------------------------
+                                # LEFT
+                                # ------------------------------------------------
+
+                                if (
+
+                                    guidance_res.zone
+                                    == Zone.LEFT
+
+                                ):
+
+                                    if step_str:
+
+                                        action = (
+                                            f"Turn left "
+                                            f"and take "
+                                            f"{step_str}."
+                                        )
+
+                                    else:
+
+                                        action = (
+                                            "Turn left."
+                                        )
+
+
+                                    message = (
+
+                                        f"Your "
+                                        f"{target_name} "
+                                        f"is on your "
+                                        f"left"
+                                        f"{dist_str}. "
+                                        f"{action}"
+
+                                    )
+
+
+                                # ------------------------------------------------
+                                # RIGHT
+                                # ------------------------------------------------
+
+                                elif (
+
+                                    guidance_res.zone
+                                    == Zone.RIGHT
+
+                                ):
+
+                                    if step_str:
+
+                                        action = (
+                                            f"Turn right "
+                                            f"and take "
+                                            f"{step_str}."
+                                        )
+
+                                    else:
+
+                                        action = (
+                                            "Turn right."
+                                        )
+
+
+                                    message = (
+
+                                        f"Your "
+                                        f"{target_name} "
+                                        f"is on your "
+                                        f"right"
+                                        f"{dist_str}. "
+                                        f"{action}"
+
+                                    )
+
+
+                                # ------------------------------------------------
+                                # CENTER
+                                # ------------------------------------------------
+
+                                else:
+
+                                    if step_str:
+
+                                        action = (
+                                            f"Walk straight "
+                                            f"{step_str}."
+                                        )
+
+                                    else:
+
+                                        action = (
+                                            "Walk straight "
+                                            "ahead."
+                                        )
+
+
+                                    message = (
+
+                                        f"Your "
+                                        f"{target_name} "
+                                        f"is ahead"
+                                        f"{dist_str}. "
+                                        f"{action}"
+
+                                    )
+
+
+                            print(
+                                f"[GUIDANCE] "
+                                f"{message}"
+                            )
 
 
                             voice.speak(
                                 message
                             )
 
+
                             target_guidance_spoke = True
 
 
         # ====================================================
-        # 8. PENDING SEARCH MESSAGE
+        # PENDING SEARCH MESSAGE
         # ====================================================
 
         if (
-            pending_target_message is not None
-            and not obstacle_spoke
-            and not target_guidance_spoke
+
+            pending_target_message
+            is not None
+
+            and
+
+            not obstacle_spoke
+
+            and
+
+            not target_guidance_spoke
+
         ):
 
             voice.speak(
@@ -837,24 +1022,7 @@ try:
 
 
         # ====================================================
-        # 9. DETECTION FILTER
-        # ====================================================
-
-        # Keep this running as part of the Phase 3 pipeline.
-        #
-        # Target guidance does not wait for this filter.
-
-        stable_detections = (
-            detection_filter.process_frame(
-                all_detections
-            )
-        )
-
-        _ = stable_detections
-
-
-        # ====================================================
-        # 10. DISPLAY
+        # DISPLAY
         # ====================================================
 
         annotated_frame = (
@@ -863,31 +1031,27 @@ try:
 
 
         cv2.imshow(
-            "Phase 3 Navigation",
+            "Navigation Mode",
             annotated_frame
         )
 
 
         # ====================================================
-        # 11. QUIT
+        # QUIT
         # ====================================================
 
-        key = cv2.waitKey(1) & 0xFF
-
-
-        if key == ord("q"):
+        if (
+            cv2.waitKey(1)
+            & 0xFF
+            == ord("q")
+        ):
 
             print(
-                "[INFO] Quit key pressed. "
-                "Stopping."
+                "[INFO] Quit key pressed."
             )
 
             break
 
-
-# ============================================================
-# CLEANUP
-# ============================================================
 
 finally:
 
@@ -896,6 +1060,5 @@ finally:
     cv2.destroyAllWindows()
 
     print(
-        "[INFO] Camera released. "
-        "Phase 3 Navigation stopped."
+        "[INFO] Navigation stopped."
     )

@@ -1,324 +1,581 @@
 """
 navigation/target_search.py
 
-Target object search logic for the AI-Based Assistive Spatial Memory
-and Guidance System.
+Target object search logic for the AI-Based Assistive Spatial
+Memory and Guidance System.
 
-This module receives DetectionResult objects (produced by spatial_analyzer.py)
-and performs a one-shot search: collect a short frame window, verify consistent
-detection, announce the result once, then stop.
+Searches continuously for a target for a configurable amount of time.
+The target must be detected in consecutive frames before being confirmed.
 
-No camera, no YOLO model, no OpenCV, no voice output — only search logic.
+No camera, no YOLO model, no OpenCV, no voice output.
 """
 
 import re
+import time
 from dataclasses import dataclass
 from typing import Optional
 
 from navigation.spatial_analyzer import DetectionResult, Zone
 
 
-# ---------------------------------------------------------------------------
-# Configuration constants
-# ---------------------------------------------------------------------------
+# ============================================================
+# CONFIGURATION
+# ============================================================
 
-# Consecutive frames the target must appear in to be confirmed
+# Target must be detected in this many consecutive frames
+# before it is considered confirmed.
 REQUIRED_FRAMES: int = 3
 
-# Total frames to search before reporting "not currently visible"
-SEARCH_WINDOW_FRAMES: int = 15
+# Maximum amount of time to search for the target.
+# This replaces the old frame-based search window.
+SEARCH_TIMEOUT_SECONDS: float = 30.0
 
 
-# ---------------------------------------------------------------------------
-# YOLO class aliases — maps user-friendly names to YOLO class labels
-# ---------------------------------------------------------------------------
+# ============================================================
+# YOLO CLASS ALIASES
+# ============================================================
 
+# Friendly names -> YOLO class names
 SEARCH_ALIASES: dict[str, str] = {
-    "phone":        "cell phone",
-    "mobile":       "cell phone",
-    "cellphone":    "cell phone",
-    "table":        "dining table",
-    "tv":           "tv",
-    "television":   "tv",
-    "laptop":       "laptop",
-    "computer":     "laptop",
-    "bottle":       "bottle",
-    "cup":          "cup",
-    "mug":          "cup",
-    "chair":        "chair",
-    "book":         "book",
-    "backpack":     "backpack",
-    "bag":          "handbag",
-    "handbag":      "handbag",
-    "suitcase":     "suitcase",
-    "remote":       "remote",
-    "keyboard":     "keyboard",
-    "clock":        "clock",
+
+    "phone": "cell phone",
+    "mobile": "cell phone",
+    "cellphone": "cell phone",
+
+    "table": "dining table",
+
+    "tv": "tv",
+    "television": "tv",
+
+    "laptop": "laptop",
+    "computer": "laptop",
+
+    "bottle": "bottle",
+
+    "cup": "cup",
+    "mug": "cup",
+
+    "chair": "chair",
+
+    "book": "book",
+
+    "backpack": "backpack",
+
+    "bag": "handbag",
+    "handbag": "handbag",
+
+    "suitcase": "suitcase",
+
+    "remote": "remote",
+
+    "keyboard": "keyboard",
+
+    "clock": "clock",
 }
 
 
-# ---------------------------------------------------------------------------
-# Output data structures
-# ---------------------------------------------------------------------------
+# ============================================================
+# OUTPUT DATA STRUCTURE
+# ============================================================
 
 @dataclass
 class TargetSearchResult:
-    """
-    Result of a single target-search frame evaluation.
 
-    Attributes
-    ----------
-    found : bool
-        True when the target object is detected this frame.
-    object_name : str
-        Normalized YOLO class name of the target (e.g. "bottle").
-    zone : str
-        Spatial zone: LEFT, CENTER, or RIGHT (empty when not found).
-    confidence : float
-        Detection confidence of the best matching box (0.0 when not found).
-    message : str or None
-        A spoken message when the search completes this frame, else None.
-    distance : None
-        Placeholder for future distance estimation integration.
-    """
-    found      : bool
+    found: bool
     object_name: str
-    zone       : str
-    confidence : float
-    message    : Optional[str]
-    distance   : None = None
+    zone: str
+    confidence: float
+    message: Optional[str]
+    distance: Optional[float] = None
 
 
-# ---------------------------------------------------------------------------
-# Main search class
-# ---------------------------------------------------------------------------
+# ============================================================
+# TARGET SEARCH CLASS
+# ============================================================
 
 class TargetSearch:
-    """
-    One-shot target object search engine.
 
-    Usage
-    -----
-    search = TargetSearch()
-    search.set_target("find my bottle")
-
-    # Each frame while searching, pass all DetectionResult objects:
-    result = search.process_frame(all_detections)
-
-    # result.message is set exactly once when the search completes,
-    # then the search automatically stops.
-    """
-
-    # Regex patterns for parsing natural-language search requests
     _FIND_PATTERNS = [
-        re.compile(r"^find\s+(?:my\s+|the\s+|a\s+)?(.+?)[\.\!\?]*$", re.IGNORECASE),
-        re.compile(r"^search\s+(?:for\s+)?(?:my\s+|the\s+|a\s+)?(.+?)[\.\!\?]*$", re.IGNORECASE),
-        re.compile(r"^locate\s+(?:my\s+|the\s+|a\s+)?(.+?)[\.\!\?]*$", re.IGNORECASE),
-        re.compile(r"^where\s+is\s+(?:my\s+|the\s+|a\s+)?(.+?)[\.\!\?]*$", re.IGNORECASE),
+
+        re.compile(
+            r"^find\s+(?:my\s+|the\s+|a\s+)?(.+?)[\.\!\?]*$",
+            re.IGNORECASE,
+        ),
+
+        re.compile(
+            r"^search\s+(?:for\s+)?(?:my\s+|the\s+|a\s+)?(.+?)[\.\!\?]*$",
+            re.IGNORECASE,
+        ),
+
+        re.compile(
+            r"^locate\s+(?:my\s+|the\s+|a\s+)?(.+?)[\.\!\?]*$",
+            re.IGNORECASE,
+        ),
+
+        re.compile(
+            r"^where\s+is\s+(?:my\s+|the\s+|a\s+)?(.+?)[\.\!\?]*$",
+            re.IGNORECASE,
+        ),
     ]
 
-    def __init__(self) -> None:
-        self._target_name      : Optional[str] = None
-        self._active           : bool = False
-        self._window_frames    : int  = 0
-        self._consecutive_hits : int  = 0
-        self._error_message    : Optional[str] = None
 
-    # ------------------------------------------------------------------
-    # Public interface
-    # ------------------------------------------------------------------
+    # ========================================================
+    # INITIALIZATION
+    # ========================================================
+
+    def __init__(self) -> None:
+
+        self._target_name: Optional[str] = None
+        self._active: bool = False
+        self._consecutive_hits: int = 0
+        self._search_start_time: Optional[float] = None
+        self._error_message: Optional[str] = None
+
+
+    # ========================================================
+    # PROPERTIES
+    # ========================================================
 
     @property
     def is_active(self) -> bool:
-        """True while a one-shot search is in progress."""
-        return self._active and self._target_name is not None
+        return (
+            self._active
+            and self._target_name is not None
+        )
+
 
     @property
     def target_name(self) -> Optional[str]:
-        """The normalized YOLO class name being searched for, or None."""
         return self._target_name
 
-    def parse_request(self, text: str) -> Optional[str]:
-        """
-        Parse a natural-language search request into a normalized object name.
 
-        Examples
-        --------
-        "Find my bottle."  -> "bottle"
-        "find the phone"   -> "cell phone"
-        "bottle"           -> "bottle"  (bare name also accepted)
-        """
+    # ========================================================
+    # PARSE REQUEST
+    # ========================================================
+
+    def parse_request(
+        self,
+        text: str,
+    ) -> Optional[str]:
+
         text = text.strip()
+
         if not text:
             return None
 
         for pattern in self._FIND_PATTERNS:
-            match = pattern.match(text)
-            if match:
-                return self._normalize_name(match.group(1).strip())
 
+            match = pattern.match(text)
+
+            if match:
+
+                return self._normalize_name(
+                    match.group(1).strip()
+                )
+
+        # Bare object name
         return self._normalize_name(text)
 
-    def set_target(self, name_or_phrase: str) -> Optional[str]:
-        """
-        Start a one-shot search for the given object.
 
-        Returns the normalized target name if recognized, else None.
+    # ========================================================
+    # COMPATIBILITY ALIAS
+    # ========================================================
+
+    def parse_command(
+        self,
+        text: str,
+    ) -> Optional[str]:
         """
-        normalized = self.parse_request(name_or_phrase)
+        Compatibility alias for older code/tests.
+
+        Both parse_command() and parse_request()
+        perform the same operation.
+        """
+
+        return self.parse_request(text)
+
+
+    # ========================================================
+    # SET TARGET
+    # ========================================================
+
+    def set_target(
+        self,
+        name_or_phrase: str,
+    ) -> Optional[str]:
+
+        normalized = self.parse_request(
+            name_or_phrase
+        )
 
         if normalized is None:
-            self._error_message = "Could not understand that search request."
+
+            self._error_message = (
+                "Could not understand that search request."
+            )
+
             return None
 
         if normalized not in self._all_valid_classes():
+
             self._error_message = (
-                f"I don't recognize '{normalized}' as a searchable object type."
+                f"I don't recognize "
+                f"'{normalized}' as a searchable object type."
             )
+
             return None
 
-        self._target_name      = normalized
-        self._active           = True
-        self._window_frames    = 0
+        # Start new search
+        self._target_name = normalized
+        self._active = True
         self._consecutive_hits = 0
-        self._error_message    = None
+        self._search_start_time = time.monotonic()
+        self._error_message = None
+
+        print(
+            f"[SEARCH] Target set to: {normalized}"
+        )
+
+        print(
+            f"[SEARCH] Searching for up to "
+            f"{SEARCH_TIMEOUT_SECONDS:.0f} seconds."
+        )
 
         return normalized
 
+
+    # ========================================================
+    # CLEAR TARGET
+    # ========================================================
+
     def clear_target(self) -> None:
-        """Cancel an in-progress search."""
-        self._target_name      = None
-        self._active           = False
-        self._window_frames    = 0
+
+        self._target_name = None
+        self._active = False
         self._consecutive_hits = 0
+        self._search_start_time = None
+
+
+    # ========================================================
+    # CANCEL
+    # ========================================================
+
+    def cancel(self) -> None:
+        """
+        Cancel the current search.
+        """
+
+        self.clear_target()
+
+
+    # ========================================================
+    # ERROR MESSAGE
+    # ========================================================
 
     def get_error_message(self) -> Optional[str]:
-        """Return the last error message from set_target(), or None."""
+
         return self._error_message
+
+
+    # ========================================================
+    # PROCESS FRAME
+    # ========================================================
 
     def process_frame(
         self,
         detections: list[DetectionResult],
     ) -> TargetSearchResult:
-        """
-        Process one frame of a one-shot search.
 
-        While the search is active, accumulates detections across frames.
-        Returns a message exactly once when the search completes (found or
-        not visible), then automatically stops.
-        """
-        if not self.is_active or self._target_name is None:
+        # ----------------------------------------------------
+        # No active search
+        # ----------------------------------------------------
+
+        if (
+            not self.is_active
+            or self._target_name is None
+        ):
+
             return TargetSearchResult(
-                found=False, object_name="", zone="",
-                confidence=0.0, message=None,
+                found=False,
+                object_name="",
+                zone="",
+                confidence=0.0,
+                message=None,
             )
 
         target = self._target_name
-        self._window_frames += 1
 
-        match   = self._find_best_match(detections, target)
+
+        # ----------------------------------------------------
+        # Calculate elapsed search time
+        # ----------------------------------------------------
+
+        elapsed = 0.0
+
+        if self._search_start_time is not None:
+
+            elapsed = (
+                time.monotonic()
+                - self._search_start_time
+            )
+
+
+        # ----------------------------------------------------
+        # Find target in current frame
+        # ----------------------------------------------------
+
+        match = self._find_best_match(
+            detections,
+            target,
+        )
+
+        found = False
+        zone = ""
+        confidence = 0.0
         message = None
-        found   = False
-        zone    = ""
-        conf    = 0.0
+
+
+        # ====================================================
+        # TARGET FOUND IN CURRENT FRAME
+        # ====================================================
 
         if match is not None:
+
             found = True
-            zone  = match.zone
-            conf  = match.confidence
+
+            zone = match.zone
+            confidence = match.confidence
+
             self._consecutive_hits += 1
 
-            if self._consecutive_hits >= REQUIRED_FRAMES:
+            print(
+                f"[TARGET] {target} detected | "
+                f"confidence={confidence:.2f} | "
+                f"zone={zone} | "
+                f"confirmation="
+                f"{self._consecutive_hits}/"
+                f"{REQUIRED_FRAMES}"
+            )
+
+
+            # ------------------------------------------------
+            # CONFIRM TARGET
+            # ------------------------------------------------
+
+            if (
+                self._consecutive_hits
+                >= REQUIRED_FRAMES
+            ):
+
                 message = self.build_message(
                     found=True,
                     object_name=target,
                     zone=zone,
                 )
+
                 self._finish_search()
+
+
+        # ====================================================
+        # TARGET NOT FOUND IN CURRENT FRAME
+        # ====================================================
+
         else:
+
+            if self._consecutive_hits > 0:
+
+                print(
+                    f"[TARGET] {target} detection "
+                    f"interrupted. "
+                    f"Resetting confirmation."
+                )
+
             self._consecutive_hits = 0
 
-        if self.is_active and self._window_frames >= SEARCH_WINDOW_FRAMES:
+
+        # ====================================================
+        # SEARCH TIMEOUT
+        # ====================================================
+
+        if (
+            self.is_active
+            and elapsed >= SEARCH_TIMEOUT_SECONDS
+        ):
+
+            print(
+                f"[SEARCH] Search timeout after "
+                f"{elapsed:.1f} seconds."
+            )
+
             message = self.build_message(
                 found=False,
                 object_name=target,
                 zone="",
             )
+
             found = False
-            zone  = ""
-            conf  = 0.0
+            zone = ""
+            confidence = 0.0
+
             self._finish_search()
 
+
+        # ====================================================
+        # RETURN RESULT
+        # ====================================================
+
         return TargetSearchResult(
-            found       = found,
-            object_name = target if self._target_name or message else "",
-            zone        = zone,
-            confidence  = conf,
-            message     = message,
+
+            found=found,
+
+            object_name=(
+                target
+                if (
+                    self._target_name is not None
+                    or message is not None
+                )
+                else ""
+            ),
+
+            zone=zone,
+
+            confidence=confidence,
+
+            message=message,
         )
+
+
+    # ============================================================
+    # BUILD SPOKEN MESSAGE
+    # ============================================================
 
     def build_message(
         self,
-        found      : bool,
+        found: bool,
         object_name: str,
-        zone       : str,
+        zone: str,
     ) -> Optional[str]:
-        """Build a spoken message for a completed search."""
+
         if not found:
-            return f"Your {object_name} is not currently visible."
+
+            return (
+                f"Your {object_name} "
+                f"is not currently visible."
+            )
 
         if zone == Zone.LEFT:
-            return f"Your {object_name} is on your left."
-        elif zone == Zone.RIGHT:
-            return f"Your {object_name} is on your right."
-        else:
-            return f"Your {object_name} is ahead."
 
-    # ------------------------------------------------------------------
-    # Private helpers
-    # ------------------------------------------------------------------
+            return (
+                f"Your {object_name} "
+                f"is on your left."
+            )
+
+        elif zone == Zone.RIGHT:
+
+            return (
+                f"Your {object_name} "
+                f"is on your right."
+            )
+
+        else:
+
+            return (
+                f"Your {object_name} "
+                f"is ahead."
+            )
+
+
+    # ============================================================
+    # FINISH SEARCH
+    # ============================================================
 
     def _finish_search(self) -> None:
-        """End the current search and reset internal counters."""
-        self._active           = False
-        self._window_frames    = 0
+
+        self._active = False
         self._consecutive_hits = 0
-        self._target_name      = None
+        self._search_start_time = None
+        self._target_name = None
+
+
+    # ============================================================
+    # VALID YOLO CLASSES
+    # ============================================================
 
     @staticmethod
     def _all_valid_classes() -> set[str]:
-        return set(SEARCH_ALIASES.values())
+
+        return set(
+            SEARCH_ALIASES.values()
+        )
+
+
+    # ============================================================
+    # NORMALIZE OBJECT NAME
+    # ============================================================
 
     @staticmethod
-    def _normalize_name(raw: str) -> Optional[str]:
+    def _normalize_name(
+        raw: str,
+    ) -> Optional[str]:
+
         key = raw.strip().lower()
+
         if not key:
             return None
 
         if key in SEARCH_ALIASES:
+
             return SEARCH_ALIASES[key]
 
         if key in SEARCH_ALIASES.values():
+
             return key
 
         return key
 
+
+    # ============================================================
+    # FIND BEST TARGET MATCH
+    # ============================================================
+
     @staticmethod
     def _find_best_match(
         detections: list[DetectionResult],
-        target    : str,
+        target: str,
     ) -> Optional[DetectionResult]:
-        """Find the best matching detection for the target class name."""
-        target_lower = target.lower()
+
+        target_lower = (
+            target.lower().strip()
+        )
+
         candidates = [
-            d for d in detections
-            if d.object_name.lower() == target_lower
+
+            d
+
+            for d in detections
+
+            if (
+                d.object_name
+                and
+                d.object_name.lower().strip()
+                == target_lower
+            )
+
         ]
 
         if not candidates:
+
             return None
 
+        # If multiple target objects are visible,
+        # select the highest-confidence one.
         return max(
+
             candidates,
-            key=lambda d: (d.confidence, d.box_area),
+
+            key=lambda d: (
+                d.confidence,
+                d.box_area,
+            ),
+
         )

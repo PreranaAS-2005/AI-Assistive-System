@@ -1,19 +1,16 @@
 """
 navigation/target_guidance.py
 
-Continuous guidance for a requested target object.
+Safe continuous guidance for a requested target.
 
-Example:
+Responsibilities:
+    - Track requested target
+    - Stabilize LEFT / CENTER / RIGHT direction
+    - Generate clear direction guidance
+    - Avoid unnecessary repeated direction announcements
+    - Provide safety-priority messages for obstacles/steps
 
-    find chair
-
-Then guide the user:
-
-    Your chair is on your left.
-    Your chair is ahead.
-    Your chair is on your right.
-
-Distance is handled separately by navigation_main.py.
+Distance and actual speech are handled by navigation_main.py.
 """
 
 from dataclasses import dataclass
@@ -29,13 +26,28 @@ from navigation.spatial_analyzer import (
 # CONFIGURATION
 # ============================================================
 
-# Number of consecutive frames required before accepting
-# a direction change.
-REQUIRED_ZONE_FRAMES: int = 2
+# Frames required to confirm a direction.
+REQUIRED_ZONE_FRAMES = 3
 
-# Number of consecutive missing frames before deciding
-# that the target has really disappeared.
-TARGET_LOST_FRAMES: int = 20
+# Frames before target is considered lost.
+TARGET_LOST_FRAMES = 20
+
+# ============================================================
+# SAFETY OBJECTS
+# ============================================================
+
+# These names can be supplied by a future/custom detector.
+# Standard YOLOv8 COCO does NOT contain "stairs" or "steps".
+STAIR_CLASSES = {
+    "stairs",
+    "stair",
+    "steps",
+    "step",
+}
+
+OBSTACLE_CLASSES = {
+    "obstacle",
+}
 
 
 # ============================================================
@@ -53,30 +65,17 @@ class TargetGuidanceResult:
 
     confidence: float
 
+    # Safety information
+    danger_ahead: bool = False
+
+    danger_type: Optional[str] = None
+
 
 # ============================================================
 # TARGET GUIDANCE
 # ============================================================
 
 class TargetGuidance:
-    """
-    Handles continuous guidance for the object requested
-    by the user.
-
-    It does NOT:
-
-        - capture camera frames
-        - run YOLO
-        - calculate distance
-        - speak directly
-
-    It only decides when a target-direction message should
-    be generated.
-    """
-
-    # ========================================================
-    # INITIALIZATION
-    # ========================================================
 
     def __init__(self) -> None:
 
@@ -84,16 +83,15 @@ class TargetGuidance:
 
         self._target_name: Optional[str] = None
 
-        # Last direction that was actually announced.
+        # Last confirmed direction.
         self._last_announced_zone: Optional[str] = None
 
         # Direction waiting for confirmation.
         self._pending_zone: Optional[str] = None
 
-        # Number of consecutive frames supporting pending zone.
         self._pending_count = 0
 
-        # Number of consecutive frames where target was missing.
+        # Missing target frames.
         self._missing_frames = 0
 
 
@@ -125,15 +123,6 @@ class TargetGuidance:
         target_name: str,
         initial_zone: str = "",
     ) -> Optional[str]:
-        """
-        Start guidance for the requested object.
-
-        If initial_zone is supplied, that zone is considered
-        already announced.
-
-        If initial_zone is empty, the first stable detection
-        generates the first direction message.
-        """
 
         target_name = (
             target_name
@@ -142,43 +131,19 @@ class TargetGuidance:
         )
 
         if not target_name:
-
             return None
-
 
         self._active = True
 
         self._target_name = target_name
 
-
-        # ----------------------------------------------------
-        # Initial zone
-        #
-        # This is important for the unit test:
-        #
-        # If CENTER was already announced, another CENTER
-        # announcement should not be generated.
-        # ----------------------------------------------------
-
         if initial_zone:
-
-            self._last_announced_zone = (
-                initial_zone
-            )
-
+            self._last_announced_zone = initial_zone
         else:
-
             self._last_announced_zone = None
 
-
-        # ----------------------------------------------------
-        # Reset pending state
-        # ----------------------------------------------------
-
         self._pending_zone = None
-
         self._pending_count = 0
-
         self._missing_frames = 0
 
         return None
@@ -189,9 +154,6 @@ class TargetGuidance:
     # ========================================================
 
     def stop(self) -> None:
-        """
-        Stop target guidance and clear all state.
-        """
 
         self._active = False
 
@@ -214,20 +176,12 @@ class TargetGuidance:
         self,
         detections: list[DetectionResult],
     ) -> TargetGuidanceResult:
-        """
-        Process the current frame.
-
-        Only the requested object is considered.
-        """
 
         # ----------------------------------------------------
-        # Guidance inactive
+        # Inactive
         # ----------------------------------------------------
 
-        if (
-            not self.is_active
-            or self._target_name is None
-        ):
+        if not self.is_active:
 
             return TargetGuidanceResult(
                 message=None,
@@ -238,7 +192,29 @@ class TargetGuidance:
 
 
         # ----------------------------------------------------
-        # Find requested object
+        # SAFETY CHECK FIRST
+        # ----------------------------------------------------
+
+        danger_type = self._check_danger_ahead(
+            detections
+        )
+
+        if danger_type is not None:
+
+            return TargetGuidanceResult(
+                message=self._build_safety_message(
+                    danger_type
+                ),
+                zone=Zone.CENTER,
+                found=True,
+                confidence=0.0,
+                danger_ahead=True,
+                danger_type=danger_type,
+            )
+
+
+        # ----------------------------------------------------
+        # Find requested target
         # ----------------------------------------------------
 
         match = self._find_best_match(
@@ -255,25 +231,15 @@ class TargetGuidance:
 
             self._missing_frames += 1
 
-            # Temporary YOLO miss should not immediately
-            # produce "no longer visible".
             self._pending_zone = None
-
             self._pending_count = 0
-
-
-            # ------------------------------------------------
-            # Target really disappeared
-            # ------------------------------------------------
 
             if (
                 self._missing_frames
                 >= TARGET_LOST_FRAMES
             ):
 
-                target_name = (
-                    self._target_name
-                )
+                target_name = self._target_name
 
                 message = (
                     f"Your {target_name} "
@@ -311,7 +277,54 @@ class TargetGuidance:
 
 
         # ====================================================
-        # SAME ZONE
+        # FIRST CONFIRMED TARGET DIRECTION
+        # ====================================================
+
+        if self._last_announced_zone is None:
+
+            if (
+                current_zone
+                == self._pending_zone
+            ):
+
+                self._pending_count += 1
+
+            else:
+
+                self._pending_zone = current_zone
+                self._pending_count = 1
+
+
+            if (
+                self._pending_count
+                >= REQUIRED_ZONE_FRAMES
+            ):
+
+                self._last_announced_zone = current_zone
+
+                self._pending_zone = None
+                self._pending_count = 0
+
+                return TargetGuidanceResult(
+                    message=self._build_message(
+                        current_zone
+                    ),
+                    zone=current_zone,
+                    found=True,
+                    confidence=confidence,
+                )
+
+
+            return TargetGuidanceResult(
+                message=None,
+                zone=current_zone,
+                found=True,
+                confidence=confidence,
+            )
+
+
+        # ====================================================
+        # SAME DIRECTION
         # ====================================================
 
         if (
@@ -320,7 +333,6 @@ class TargetGuidance:
         ):
 
             self._pending_zone = None
-
             self._pending_count = 0
 
             return TargetGuidanceResult(
@@ -332,7 +344,7 @@ class TargetGuidance:
 
 
         # ====================================================
-        # NEW ZONE
+        # NEW DIRECTION
         # ====================================================
 
         if (
@@ -345,12 +357,11 @@ class TargetGuidance:
         else:
 
             self._pending_zone = current_zone
-
             self._pending_count = 1
 
 
         # ====================================================
-        # CONFIRM DIRECTION
+        # CONFIRM NEW DIRECTION
         # ====================================================
 
         if (
@@ -358,31 +369,20 @@ class TargetGuidance:
             >= REQUIRED_ZONE_FRAMES
         ):
 
-            self._last_announced_zone = (
-                current_zone
-            )
+            self._last_announced_zone = current_zone
 
             self._pending_zone = None
-
             self._pending_count = 0
 
-
-            message = self._build_message(
-                current_zone
-            )
-
-
             return TargetGuidanceResult(
-                message=message,
+                message=self._build_message(
+                    current_zone
+                ),
                 zone=current_zone,
                 found=True,
                 confidence=confidence,
             )
 
-
-        # ----------------------------------------------------
-        # Direction not stable enough yet.
-        # ----------------------------------------------------
 
         return TargetGuidanceResult(
             message=None,
@@ -393,16 +393,13 @@ class TargetGuidance:
 
 
     # ========================================================
-    # BUILD DIRECTION MESSAGE
+    # DIRECTION MESSAGE
     # ========================================================
 
     def _build_message(
         self,
         zone: str,
     ) -> str:
-        """
-        Convert spatial zone into a natural voice message.
-        """
 
         if zone == Zone.LEFT:
 
@@ -416,11 +413,74 @@ class TargetGuidance:
 
             direction = "ahead"
 
-
         return (
             f"Your {self._target_name} "
             f"is {direction}."
         )
+
+
+    # ========================================================
+    # SAFETY MESSAGE
+    # ========================================================
+
+    @staticmethod
+    def _build_safety_message(
+        danger_type: str,
+    ) -> str:
+
+        if danger_type == "steps":
+
+            return (
+                "Steps detected ahead. "
+                "Stop. Do not walk forward."
+            )
+
+        return (
+            "Obstacle detected ahead. "
+            "Stop."
+        )
+
+
+    # ========================================================
+    # DANGER DETECTION
+    # ========================================================
+
+    @staticmethod
+    def _check_danger_ahead(
+        detections: list[DetectionResult],
+    ) -> Optional[str]:
+
+        for detection in detections:
+
+            name = (
+                detection.object_name
+                .strip()
+                .lower()
+            )
+
+            # ----------------------------------------------
+            # Steps / stairs
+            # ----------------------------------------------
+
+            if name in STAIR_CLASSES:
+
+                if detection.zone == Zone.CENTER:
+
+                    return "steps"
+
+
+            # ----------------------------------------------
+            # Generic obstacle
+            # ----------------------------------------------
+
+            if name in OBSTACLE_CLASSES:
+
+                if detection.zone == Zone.CENTER:
+
+                    return "obstacle"
+
+
+        return None
 
 
     # ========================================================
@@ -432,10 +492,6 @@ class TargetGuidance:
         detections: list[DetectionResult],
         target: str,
     ) -> Optional[DetectionResult]:
-        """
-        Find the strongest detection matching the requested
-        object name.
-        """
 
         target_lower = (
             target
@@ -443,10 +499,12 @@ class TargetGuidance:
             .lower()
         )
 
-
         candidates = [
+
             detection
+
             for detection in detections
+
             if (
                 detection.object_name
                 .strip()
@@ -455,15 +513,8 @@ class TargetGuidance:
             )
         ]
 
-
         if not candidates:
-
             return None
-
-
-        # Prefer:
-        #   1. highest confidence
-        #   2. largest bounding box
 
         return max(
             candidates,
@@ -472,3 +523,4 @@ class TargetGuidance:
                 detection.box_area,
             ),
         )
+

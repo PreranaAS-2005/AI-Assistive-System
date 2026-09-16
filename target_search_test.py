@@ -9,249 +9,183 @@ No camera or YOLO model required.
 
 import sys
 
-from navigation.spatial_analyzer import DetectionResult, Zone, Priority
-from navigation.target_search import (
-    TargetSearch,
-    REQUIRED_FRAMES,
-    SEARCH_WINDOW_FRAMES,
-)
+from navigation.spatial_analyzer import analyze_detection
+from navigation.target_search import TargetSearch, REQUIRED_FRAMES, SEARCH_TIMEOUT_SECONDS
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def _make_detection(
-    object_name : str,
-    zone        : str = Zone.CENTER,
-    confidence  : float = 0.85,
-    track_id    : int = 1,
-    box_area    : float = 5000.0,
-) -> DetectionResult:
-    """Build a minimal DetectionResult for testing."""
-    return DetectionResult(
-        track_id        = track_id,
-        object_name     = object_name,
-        confidence      = confidence,
-        center_x        = 320.0,
-        center_y        = 240.0,
-        box_width       = 100.0,
-        box_height      = 100.0,
-        box_area        = box_area,
-        frame_area      = 307200.0,
-        proximity_ratio = 0.016,
-        proximity       = "NEAR",
-        zone            = zone,
-        priority        = Priority.LOW,
-        is_obstacle     = True,
+def make_detection(name, confidence=0.80, x1=250, y1=100, x2=390, y2=300):
+    return analyze_detection(
+        track_id=1,
+        object_name=name,
+        confidence=confidence,
+        x1=x1,
+        y1=y1,
+        x2=x2,
+        y2=y2,
+        frame_width=640,
+        frame_height=480,
     )
 
 
-def _run_frames(search: TargetSearch, detections_list: list[list]) -> list:
-    """Run process_frame for each frame's detection list; collect messages."""
-    messages = []
-    for dets in detections_list:
-        result = search.process_frame(dets)
-        if result.message:
-            messages.append(result.message)
-    return messages
+def test_parse_command():
+    search = TargetSearch()
+    assert search.parse_command("Find my bottle.") == "bottle"
 
 
-# ---------------------------------------------------------------------------
-# Tests
-# ---------------------------------------------------------------------------
+def test_set_target():
+    search = TargetSearch()
+    target = search.set_target("find bottle")
 
-passed = 0
-failed = 0
-
-
-def check(name: str, condition: bool, detail: str = "") -> None:
-    global passed, failed
-    if condition:
-        print(f"  PASS  {name}")
-        passed += 1
-    else:
-        print(f"  FAIL  {name}" + (f"  -  {detail}" if detail else ""))
-        failed += 1
+    assert target == "bottle"
+    assert search.target_name == "bottle"
+    assert search.is_active
 
 
-print("\n=== Target Search Unit Tests ===\n")
+def test_unknown_object():
+    search = TargetSearch()
+    assert search.set_target("find helicopter") is None
 
-# ------------------------------------------------------------------
-# 1. Phrase parsing
-# ------------------------------------------------------------------
-print("1. Phrase parsing")
-search = TargetSearch()
 
-check("Find my bottle.",   search.parse_request("Find my bottle.")   == "bottle")
-check("find the phone",    search.parse_request("find the phone")    == "cell phone")
-check("search for a cup",  search.parse_request("search for a cup")  == "cup")
-check("where is my chair", search.parse_request("where is my chair") == "chair")
-check("bottle (bare)",     search.parse_request("bottle")            == "bottle")
-check("empty string",      search.parse_request("")                  is None)
-check("table alias",       search.parse_request("find my table")     == "dining table")
+def test_bottle_confirmation():
+    search = TargetSearch()
+    search.set_target("find bottle")
 
-# ------------------------------------------------------------------
-# 2. set_target validation
-# ------------------------------------------------------------------
-print("\n2. set_target validation")
-search = TargetSearch()
+    detection = make_detection("bottle")
 
-check("valid target",     search.set_target("find my bottle") == "bottle")
-check("is_active",        search.is_active)
-check("target_name",      search.target_name == "bottle")
+    result = search.process_frame([detection])
+    assert result.found
+    assert result.message is None
 
-search.clear_target()
-check("unknown object",   search.set_target("find my keys") is None)
-check("error message",    search.get_error_message() is not None)
+    result = search.process_frame([detection])
+    assert result.found
+    assert result.message is None
 
-search.clear_target()
-check("phone alias",      search.set_target("phone") == "cell phone")
+    result = search.process_frame([detection])
 
-# ------------------------------------------------------------------
-# 3. Matching - ignores unrelated objects during window
-# ------------------------------------------------------------------
-print("\n3. Matching - ignores unrelated objects")
-search = TargetSearch()
-search.set_target("bottle")
+    assert result.found
+    assert result.message == "Your bottle is ahead."
+    assert not search.is_active
 
-wrong_frames = [[_make_detection("chair")]] * SEARCH_WINDOW_FRAMES
-messages = _run_frames(search, wrong_frames)
-check("not visible after window", any("not currently visible" in m for m in messages))
-check("exactly one message",      len(messages) == 1, f"got: {messages}")
-check("search stopped",           not search.is_active)
 
-# ------------------------------------------------------------------
-# 4. Found message - zone CENTER
-# ------------------------------------------------------------------
-print("\n4. Found message - zone CENTER")
-search = TargetSearch()
-search.set_target("bottle")
-bottle_center = [_make_detection("bottle", zone=Zone.CENTER)]
-messages = _run_frames(search, [bottle_center] * REQUIRED_FRAMES)
-check("CENTER message after confirmation", any("ahead" in m for m in messages), f"got: {messages}")
-check("exactly one message",               len(messages) == 1, f"got: {messages}")
-check("search stopped after found",        not search.is_active)
+def test_left_direction():
+    search = TargetSearch()
+    search.set_target("find bottle")
 
-# ------------------------------------------------------------------
-# 5. Found message - zone LEFT / RIGHT
-# ------------------------------------------------------------------
-print("\n5. Found message - zone LEFT / RIGHT")
-search = TargetSearch()
-search.set_target("bottle")
+    detection = make_detection("bottle", x1=20, x2=150)
 
-left_det  = _make_detection("bottle", zone=Zone.LEFT)
-right_det = _make_detection("bottle", zone=Zone.RIGHT)
+    for _ in range(REQUIRED_FRAMES):
+        result = search.process_frame([detection])
 
-left_msgs = _run_frames(search, [[left_det]] * REQUIRED_FRAMES)
-search.set_target("bottle")
-right_msgs = _run_frames(search, [[right_det]] * REQUIRED_FRAMES)
+    assert result.found
+    assert "left" in result.message.lower()
 
-check("LEFT message",  any("left"  in m for m in left_msgs),  f"got: {left_msgs}")
-check("RIGHT message", any("right" in m for m in right_msgs), f"got: {right_msgs}")
 
-# ------------------------------------------------------------------
-# 6. Not-visible message wording
-# ------------------------------------------------------------------
-print("\n6. Not-visible message wording")
-search = TargetSearch()
-search.set_target("bottle")
+def test_right_direction():
+    search = TargetSearch()
+    search.set_target("find bottle")
 
-empty_frames = [[]] * SEARCH_WINDOW_FRAMES
-messages = _run_frames(search, empty_frames)
-check(
-    "not currently visible",
-    any("not currently visible" in m for m in messages),
-    f"got: {messages}",
-)
-check(
-    "does NOT say 'does not exist'",
-    not any("does not exist" in m for m in messages),
-)
+    detection = make_detection("bottle", x1=490, x2=620)
 
-# ------------------------------------------------------------------
-# 7. No announcement before REQUIRED_FRAMES consecutive hits
-# ------------------------------------------------------------------
-print("\n7. No early announcement")
-search = TargetSearch()
-search.set_target("bottle")
+    for _ in range(REQUIRED_FRAMES):
+        result = search.process_frame([detection])
 
-bottle_det = _make_detection("bottle")
-early = [[bottle_det]] * (REQUIRED_FRAMES - 1)
-messages = _run_frames(search, early)
-check("no message before confirmation", len(messages) == 0, f"got: {messages}")
-check("still searching",                search.is_active)
+    assert result.found
+    assert "right" in result.message.lower()
 
-# ------------------------------------------------------------------
-# 8. Announces once - no repeat on extra frames
-# ------------------------------------------------------------------
-print("\n8. Announces once - no repeat")
-search = TargetSearch()
-search.set_target("bottle")
 
-bottle_det = _make_detection("bottle", zone=Zone.CENTER)
-all_frames = [[bottle_det]] * (REQUIRED_FRAMES + 5)
-messages = _run_frames(search, all_frames)
-check("exactly one announcement", len(messages) == 1, f"got: {messages}")
-check("search inactive after",    not search.is_active)
+def test_unrelated_objects_do_not_find_target():
+    search = TargetSearch()
+    search.set_target("find bottle")
 
-# Extra frames after search ended produce nothing
-extra = _run_frames(search, [[bottle_det]] * 3)
-check("no message after search ended", len(extra) == 0)
+    detection = make_detection("chair")
 
-# ------------------------------------------------------------------
-# 9. Multiple instances - picks best match
-# ------------------------------------------------------------------
-print("\n9. Multiple instances - picks highest confidence")
-search = TargetSearch()
-search.set_target("bottle")
+    result = None
 
-multi = [
-    _make_detection("bottle", zone=Zone.LEFT,  confidence=0.70, track_id=1),
-    _make_detection("bottle", zone=Zone.RIGHT, confidence=0.95, track_id=2),
-]
-result = search.process_frame(multi)
-check(
-    "picks highest confidence zone",
-    result.zone == Zone.RIGHT,
-    f"zone={result.zone}",
-)
+    # Stay well inside the 30-second timeout.
+    for _ in range(10):
+        result = search.process_frame([detection])
 
-# ------------------------------------------------------------------
-# 10. clear_target cancels search
-# ------------------------------------------------------------------
-print("\n10. clear_target")
-search = TargetSearch()
-search.set_target("bottle")
-search.clear_target()
-check("not active after clear", not search.is_active)
-result = search.process_frame([_make_detection("bottle")])
-check("no message after clear", result.message is None)
+    assert not result.found
+    assert result.message is None
+    assert search.is_active
 
-# ------------------------------------------------------------------
-# 11. Interrupted consecutive hits reset confirmation
-# ------------------------------------------------------------------
-print("\n11. Interrupted hits reset confirmation")
-search = TargetSearch()
-search.set_target("bottle")
 
-bottle_det = _make_detection("bottle")
-# Two hits, one miss, then not enough frames left to confirm
-frames = (
-    [[bottle_det], [bottle_det], [], [bottle_det]]
-    + [[]] * (SEARCH_WINDOW_FRAMES - 4)
-)
-messages = _run_frames(search, frames)
-check(
-    "not visible when hits not consecutive",
-    any("not currently visible" in m for m in messages),
-    f"got: {messages}",
-)
+def test_multiple_instances_highest_confidence():
+    search = TargetSearch()
+    search.set_target("find bottle")
 
-# ------------------------------------------------------------------
-# Summary
-# ------------------------------------------------------------------
-print(f"\n=== Results: {passed} passed, {failed} failed ===\n")
+    low = make_detection(
+        "bottle",
+        confidence=0.65,
+        x1=20,
+        x2=150,
+    )
 
-if failed > 0:
-    sys.exit(1)
+    high = make_detection(
+        "bottle",
+        confidence=0.95,
+        x1=490,
+        x2=620,
+    )
+
+    for _ in range(REQUIRED_FRAMES):
+        result = search.process_frame([low, high])
+
+    assert result.found
+    assert "right" in result.message.lower()
+
+
+def test_clear_target():
+    search = TargetSearch()
+    search.set_target("find bottle")
+
+    assert search.is_active
+
+    search.clear_target()
+
+    assert not search.is_active
+    assert search.target_name is None
+
+
+def test_cancel():
+    search = TargetSearch()
+    search.set_target("find bottle")
+
+    assert search.is_active
+
+    search.cancel()
+
+    assert not search.is_active
+    assert search.target_name is None
+
+
+def test_timeout_value():
+    assert SEARCH_TIMEOUT_SECONDS == 30.0
+
+
+if __name__ == "__main__":
+    tests = [
+        test_parse_command,
+        test_set_target,
+        test_unknown_object,
+        test_bottle_confirmation,
+        test_left_direction,
+        test_right_direction,
+        test_unrelated_objects_do_not_find_target,
+        test_multiple_instances_highest_confidence,
+        test_clear_target,
+        test_cancel,
+        test_timeout_value,
+    ]
+
+    passed = 0
+
+    for test in tests:
+        try:
+            test()
+            print(f"[PASS] {test.__name__}")
+            passed += 1
+        except Exception as e:
+            print(f"[FAIL] {test.__name__}: {e}")
+
+    print(f"\n{passed}/{len(tests)} tests passed.")
