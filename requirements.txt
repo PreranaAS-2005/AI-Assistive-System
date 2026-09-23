@@ -39,3 +39,5 @@ typing_extensions==4.16.0
 ultralytics==8.4.112
 ultralytics-thop==2.1.5
 urllib3==2.7.0
+
+
