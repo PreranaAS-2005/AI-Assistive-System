@@ -1,4 +1,4 @@
-from voice_manager import VoiceManager
+from voice.voice_manager import VoiceManager
 
 
 voice = VoiceManager()
