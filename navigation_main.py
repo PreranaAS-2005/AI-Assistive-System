@@ -50,6 +50,9 @@ from navigation.detection_filter import DetectionFilter
 from navigation.distance_estimator import DistanceEstimator
 from navigation.distance_smoother import DistanceSmoother
 from navigation.guidance_selector import GuidanceSelector
+from navigation.path_checker import PathChecker
+from navigation.nav_utils import steps_text, direction_phrase
+from voice.voice_input import VoiceInput
 
 
 # ============================================================
@@ -130,6 +133,10 @@ guidance_selector = GuidanceSelector(
     switch_distance_margin_m=0.75,
 )
 
+path_checker = PathChecker()
+
+voice_input = VoiceInput()
+
 
 # ============================================================
 # GLOBAL STATE
@@ -141,6 +148,61 @@ pending_target_message = None
 # ============================================================
 # TERMINAL INPUT
 # ============================================================
+def handle_command(command):
+    command = command.strip()
+    if not command:
+        return
+
+    command_lower = command.lower()
+
+    if command_lower in (
+        "clear",
+        "stop",
+        "stop search",
+    ):
+        target_search.clear_target()
+        target_guidance.stop()
+        distance_smoother.reset()
+        print("[SEARCH] Target search/guidance cleared.")
+        return
+
+    if command_lower == "help":
+        print()
+        print("[SEARCH] Commands:")
+        print("         find <object>")
+        print("         find my <object>")
+        print("         clear")
+        print()
+        return
+
+    if (
+        command_lower.startswith("find")
+        or command_lower.startswith("search")
+        or command_lower.startswith("locate")
+        or command_lower.startswith("where")
+    ):
+        target_guidance.stop()
+        distance_smoother.reset()
+
+        target_name = target_search.set_target(command)
+
+        if target_name:
+            print(
+                f"[SEARCH] Searching for: "
+                f"{target_name}"
+            )
+            voice.speak(
+                f"Searching for {target_name}."
+            )
+        else:
+            error_message = (
+                target_search.get_error_message()
+            )
+            if error_message:
+                print(
+                    f"[SEARCH] {error_message}"
+                )
+        return
 
 def input_listener():
     """
@@ -149,7 +211,6 @@ def input_listener():
         find bottle
         find chair
         find laptop
-
         clear
         help
     """
@@ -160,7 +221,6 @@ def input_listener():
     )
 
     while True:
-
         try:
             command = input().strip()
 
@@ -170,7 +230,7 @@ def input_listener():
         if not command:
             continue
 
-        command_lower = command.lower()
+        handle_command(command)
 
 
         # ====================================================
@@ -273,6 +333,12 @@ def input_listener():
 # START INPUT THREAD
 # ============================================================
 
+# ============================================================
+# START VOICE INPUT
+# ============================================================
+
+voice_input.start()
+voice_input_started = True
 input_thread = threading.Thread(
     target=input_listener,
     daemon=True,
@@ -312,6 +378,20 @@ try:
             )
 
             break
+
+        # ====================================================
+        # VOICE COMMAND
+        # ====================================================
+
+        voice_command = voice_input.get_command()
+
+        if voice_command is not None:
+
+            print(
+
+                f"[VOICE] Command: {voice_command}"
+            )
+            handle_command(voice_command)
 
 
         frame_height = float(
@@ -594,6 +674,7 @@ try:
                 if search_result.found:
 
                     pending_target_message = None
+                    voice_input_started = False
 
                 else:
 
