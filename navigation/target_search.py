@@ -12,10 +12,12 @@ No camera, no YOLO model, no OpenCV, no voice output — only search logic.
 """
 
 import re
+import time
 from dataclasses import dataclass
 from typing import Optional
 
 from navigation.spatial_analyzer import DetectionResult, Zone
+from navigation.object_memory import ObjectMemory
 
 
 # ---------------------------------------------------------------------------
@@ -117,12 +119,16 @@ class TargetSearch:
         re.compile(r"^where\s+is\s+(?:my\s+|the\s+|a\s+)?(.+?)[\.\!\?]*$", re.IGNORECASE),
     ]
 
-    def __init__(self) -> None:
+    def __init__(self, object_memory: Optional[ObjectMemory] = None) -> None:
         self._target_name      : Optional[str] = None
         self._active           : bool = False
         self._window_frames    : int  = 0
         self._consecutive_hits : int  = 0
         self._error_message    : Optional[str] = None
+
+        # Shared object memory populated by navigation_main.py.
+        # Keeping this optional preserves compatibility with existing code.
+        self.object_memory = object_memory
 
     # ------------------------------------------------------------------
     # Public interface
@@ -263,16 +269,67 @@ class TargetSearch:
         object_name: str,
         zone       : str,
     ) -> Optional[str]:
-        """Build a spoken message for a completed search."""
-        if not found:
-            return f"Your {object_name} is not currently visible."
+        """Build a spoken message for a completed search.
 
-        if zone == Zone.LEFT:
+        If the object is not visible in the current search window, fall back
+        to the latest sighting stored in ObjectMemory.
+        """
+        if not found:
+            return self._build_memory_fallback_message(object_name)
+
+        if zone == Zone.LEFT or str(zone).upper() == "LEFT":
             return f"Your {object_name} is on your left."
-        elif zone == Zone.RIGHT:
+        elif zone == Zone.RIGHT or str(zone).upper() == "RIGHT":
             return f"Your {object_name} is on your right."
         else:
             return f"Your {object_name} is ahead."
+
+    def _build_memory_fallback_message(self, object_name: str) -> str:
+        """Build a last-seen message when the target is not in the current frame."""
+        if self.object_memory is None:
+            return f"Your {object_name} is not currently visible."
+
+        memory = self.object_memory.get_last_seen(object_name)
+
+        if memory is None:
+            return f"I haven't detected your {object_name} yet."
+
+        elapsed = max(0.0, time.time() - memory.get("timestamp", time.time()))
+
+        if elapsed < 30:
+            time_text = "just now"
+        elif elapsed < 120:
+            time_text = "about a minute ago"
+        elif elapsed < 600:
+            time_text = "a few minutes ago"
+        else:
+            time_text = "more than 10 minutes ago"
+
+        direction = str(memory.get("direction", "")).upper()
+        distance = str(memory.get("distance", "")).upper()
+
+        direction_text = {
+            "LEFT": "on your left",
+            "CENTER": "in front of you",
+            "RIGHT": "on your right",
+        }.get(direction, "in an unknown direction")
+
+        distance_text = {
+            "CLOSE": "very close",
+            "NEAR": "nearby",
+            "FAR": "far away",
+        }.get(distance, "")
+
+        if distance_text:
+            return (
+                f"I cannot see your {object_name} right now. "
+                f"I last saw it {time_text}, {distance_text}, {direction_text}."
+            )
+
+        return (
+            f"I cannot see your {object_name} right now. "
+            f"I last saw it {time_text}, {direction_text}."
+        )
 
     # ------------------------------------------------------------------
     # Private helpers
